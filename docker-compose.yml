@@ -1,0 +1,114 @@
+# Unified stack for all three owlbot projects: this backend (app), the
+# React frontend, and the Python gRPC file-conversion service.
+#
+# Layout this expects on the deploy host (same as on this machine):
+#   <parent>/node_prac/owlbot                       <- this file lives here
+#   <parent>/javascript_prac/chat_ui_4/react-ts-vite-app
+#   <parent>/python_prac/owlbot
+#
+# Run everything with:  docker compose up -d --build
+# from this (node_prac/owlbot) directory.
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: owlbot-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # override just the pieces that must point at the compose network,
+      # rather than localhost, since containers talk to each other by service name
+      - POSTGRES_HOST=postgres
+      - QDRANT_URL=http://qdrant:6333
+      - GRPC_SERVER_ADDRESS=grpc:50051
+    # not published — only the frontend's nginx needs to reach this, over
+    # the internal compose network. Uncomment to hit it directly for debugging.
+    # ports:
+    #   - "3000:3000"
+    expose:
+      - "3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      grpc:
+        condition: service_started
+    volumes:
+      # if any part of the app still writes local session/auth state, keep it outside the container
+      - app_data:/app/data
+
+  grpc:
+    build:
+      context: ../../python_prac/owlbot
+      dockerfile: Dockerfile
+    container_name: owlbot-grpc
+    restart: unless-stopped
+    # internal only — the "app" service is the sole caller
+    expose:
+      - "50051"
+
+  frontend:
+    build:
+      context: ../../javascript_prac/chat_ui_4/react-ts-vite-app
+      dockerfile: Dockerfile
+      args:
+        # baked into the JS bundle at build time — the browser calls these
+        # directly, so VITE_API_URL should stay a same-origin relative path
+        # ("/api") that nginx (see that project's nginx.conf) proxies to "app"
+        - VITE_API_URL=${VITE_API_URL:-/api}
+        - VITE_FIREBASECONFIG_API=${VITE_FIREBASECONFIG_API}
+    container_name: owlbot-frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - app
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: owlbot-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # the postgres image itself only ever reads POSTGRES_USER/PASSWORD/DB
+      # (hardcoded by its entrypoint script), so we map your .env names onto those here
+      - POSTGRES_USER=${POSTGRES_USERNAME}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DATABASE}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # not published — only "app" needs this, over the internal compose
+    # network. Uncomment if you need to reach Postgres from outside the host.
+    # ports:
+    #   - "${POSTGRES_PORT}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME} -d ${POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: owlbot-qdrant
+    restart: unless-stopped
+    volumes:
+      - qdrant_data:/qdrant/storage
+    # not published by default — uncomment if you need to reach Qdrant's
+    # dashboard/API from outside the host.
+    # ports:
+    #   - "6333:6333"
+
+networks:
+  default:
+    name: owlbot-net
+
+volumes:
+  pgdata:
+  qdrant_data:
+  app_data:
