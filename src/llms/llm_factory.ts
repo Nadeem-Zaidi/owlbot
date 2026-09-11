@@ -8,6 +8,7 @@ import { LLMConfig } from "../types/lmconfig";
 import { OpenAIProvider } from "./openai_provider";
 import { MessageService } from "../service/message_service";
 import { LLMTool } from "../tools/tool_registry";
+import { IFileStore } from "../interfaces/ifilestore";
 
 export type LLMProvider = "openai" | "ollama" | "gemma";
 
@@ -27,6 +28,10 @@ interface CreateOptions {
     messageService: MessageService;
     toolRegistry: LLMTool;
     context?: LLMContext;
+    // Optional — lets OpenAIProvider mirror code-interpreter-generated
+    // files to S3 so chat history stays viewable after OpenAI's container
+    // recycles. Omit it and that mirroring is just silently skipped.
+    fileStore?: IFileStore;
 }
 
 export class LLMFactory {
@@ -36,6 +41,7 @@ export class LLMFactory {
         messageService,
         toolRegistry,
         context = { userId: "", sessionId: "" }, // still unused below — fine as a forward-looking default, drop it if you don't need it soon
+        fileStore,
     }: CreateOptions): ILLM {
         switch (provider) {
             case "openai": {
@@ -45,7 +51,7 @@ export class LLMFactory {
                     // deep inside the OpenAI SDK on the first real request
                     throw new Error("OPENAI_API_KEY is not set");
                 }
-                return new OpenAIProvider(apiKey, config, messageService, toolRegistry);
+                return new OpenAIProvider(apiKey, config, messageService, toolRegistry, fileStore);
             }
             case "gemma":
             case "ollama":
@@ -56,7 +62,7 @@ export class LLMFactory {
         }
     }
 
-    static createFromEnv(messageService: MessageService, toolRegistry: LLMTool): ILLM {
+    static createFromEnv(messageService: MessageService, toolRegistry: LLMTool, fileStore?: IFileStore): ILLM {
         const useLocalLLM = process.env.USE_LOCAL_LLM === "true";
         const temperature = process.env.LLM_TEMPERATURE
             ? parseFloat(process.env.LLM_TEMPERATURE)
@@ -89,6 +95,7 @@ export class LLMFactory {
             },
             messageService,
             toolRegistry, // NEW — passed where OpenAIProvider's constructor actually reads it
+            fileStore,
         });
     }
 }

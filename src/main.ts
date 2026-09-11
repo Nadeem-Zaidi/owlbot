@@ -54,7 +54,7 @@ async function wa() {
     const embed = new EmbedderAdapter(embedder);
     const toolRegistry = new LLMTool();
     toolRegistry.registerBuiltin(createVectorSearchTool(vectorDb, embed));
-    const llmService = LLMFactory.createFromEnv(chatMessageService, toolRegistry);
+    const llmService = LLMFactory.createFromEnv(chatMessageService, toolRegistry, s3Client);
     const chatRoutes = new ChatMessages(chatMessageService, llmService);
     const storageRoutes = new StorageRoutes(s3Client, embedder);
     const gateway = new VGateway(3000, db, chatRoutes, storageRoutes);

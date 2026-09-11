@@ -1,14 +1,3 @@
-# Unified stack for all three owlbot projects: this backend (app), the
-# React frontend, and the Python gRPC file-conversion service.
-#
-# Layout this expects on the deploy host (same as on this machine):
-#   <parent>/node_prac/owlbot                       <- this file lives here
-#   <parent>/javascript_prac/chat_ui_4/react-ts-vite-app
-#   <parent>/python_prac/owlbot
-#
-# Run everything with:  docker compose up -d --build
-# from this (node_prac/owlbot) directory.
-
 services:
   app:
     build:
@@ -43,7 +32,7 @@ services:
 
   grpc:
     build:
-      context: ../../python_prac/owlbot
+      context: ../owlbot_grpc
       dockerfile: Dockerfile
     container_name: owlbot-grpc
     restart: unless-stopped
@@ -53,7 +42,7 @@ services:
 
   frontend:
     build:
-      context: ../../javascript_prac/chat_ui_4/react-ts-vite-app
+      context: ../strix
       dockerfile: Dockerfile
       args:
         # baked into the JS bundle at build time — the browser calls these

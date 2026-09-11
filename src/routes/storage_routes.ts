@@ -1,5 +1,6 @@
 import multer from "multer";
-import { Chunk, IFileStore } from "../interfaces/ifilestore";
+import OpenAI, { toFile } from "openai";
+import { Chunk, IFileStore, ListResult } from "../interfaces/ifilestore";
 import { BaseRouter } from "./base_router";
 import { Embedder } from "../database/vector_db/embedding";
 import { chunkMarkdown} from "../vector_db/chunking";
@@ -15,8 +16,28 @@ const upload = multer({
 
 const MAX_CONCURRENT_FILE_OPS = 5;
 
+// Only spreadsheets get mirrored to OpenAI's Files API for code interpreter —
+// everything else (pdf, docx, images, txt, ...) keeps going through the
+// existing S3 + markdown-conversion + RAG indexing path unchanged. Code
+// interpreter's actual value-add is running pandas/numpy over tabular data;
+// there's no reason to also push every PDF and image through a second
+// upload just to sit unused in an OpenAI container.
+const SPREADSHEET_EXTENSIONS = new Set(["csv", "xls", "xlsx"]);
+
+function isSpreadsheetFile(filename: string): boolean {
+    const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+    return SPREADSHEET_EXTENSIONS.has(ext);
+}
+
+// Lazy/optional — if OPENAI_API_KEY isn't set, spreadsheet-to-code-interpreter
+// mirroring is silently skipped (see uploadToOpenAI's catch) rather than
+// breaking uploads entirely.
+const openaiClient = process.env.OPENAI_API_KEY
+    ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+    : null;
+
 type UploadOutcome =
-    | { name: string; status: "uploaded"; url: string }
+    | { name: string; status: "uploaded"; url: string; openaiFileId?: string }
     | { name: string; status: "failed"; error: string };
 
 export class StorageRoutes extends BaseRouter<IFileStore> {
@@ -28,9 +49,32 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
         this.router.get("/list_files", this.asyncHandler(async (req, res, next) => {
             try {
                 const continuationToken = req.query.continuationToken as string | undefined;
+                const search = (req.query.search as string | undefined)?.trim();
                 const prefix = `${req.user?.sub}/`;
+
+                // S3's ListObjectsV2 only supports a `Prefix` match (from the
+                // start of the key), not an arbitrary substring search, so a
+                // real search has to walk pages server-side and filter by
+                // filename itself — see searchFiles(). This intentionally
+                // returns a flat match list with no continuationToken rather
+                // than trying to paginate search results the same way a plain
+                // listing is paginated.
+                if (search) {
+                    const matches = await this.searchFiles(prefix, search);
+                    return res.status(200).json({ files: matches, continuationToken: undefined });
+                }
+
                 const result = await this.service.list(prefix, continuationToken, { includeUrls: true });
-                return res.status(200).json(result);
+                // IFileStore.list() returns { folders, files, nextToken } (see
+                // ListResult) — the frontend's ListFilesResponse type and all of
+                // storage.tsx's pager logic read `continuationToken`, a field
+                // that never actually existed on this response. That mismatch
+                // meant `hasNextPage` was always false after page 1, so "Next"
+                // stayed disabled forever regardless of how many files existed.
+                return res.status(200).json({
+                    files: result.files,
+                    continuationToken: result.nextToken,
+                });
             } catch (error) {
                 next(error);
             }
@@ -135,7 +179,18 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
         try {
             const uploaded = await this.service.uploadAndGetUrls(filesToUpload, prefix);
             const originalFileResult = uploaded.find((u) => u.originalname === file.originalname);
-            return { name: file.originalname, status: "uploaded", url: originalFileResult?.url ?? "" };
+
+            let openaiFileId: string | undefined;
+            if (isSpreadsheetFile(file.originalname)) {
+                openaiFileId = await this.uploadToOpenAI(file);
+            }
+
+            return {
+                name: file.originalname,
+                status: "uploaded",
+                url: originalFileResult?.url ?? "",
+                ...(openaiFileId ? { openaiFileId } : {}),
+            };
         } catch (error) {
             if (vectorIds.length > 0) {
                 try {
@@ -146,6 +201,62 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
             }
             return { name: file.originalname, status: "failed", error: `Upload failed: ${error}` };
         }
+    }
+
+    // Mirrors a spreadsheet to OpenAI's Files API so the code interpreter
+    // container can later be given its file_id and actually read it —
+    // uploading to S3 alone (uploadAndGetUrls above) only produces a link,
+    // which the container has no way to fetch. Failure here is deliberately
+    // non-fatal: the S3 upload and RAG indexing already succeeded by the
+    // time this runs, so a hiccup with OpenAI (missing key, transient
+    // network error) should degrade to "code interpreter can't see this
+    // file yet" rather than failing the whole upload.
+    private async uploadToOpenAI(file: Express.Multer.File): Promise<string | undefined> {
+        if (!openaiClient) {
+            console.warn(`[upload] OPENAI_API_KEY not set — skipping code-interpreter mirror for "${file.originalname}"`);
+            return undefined;
+        }
+        try {
+            const uploadableFile = await toFile(file.buffer, file.originalname, { type: file.mimetype });
+            const created = await openaiClient.files.create({
+                file: uploadableFile,
+                purpose: "assistants",
+            });
+            return created.id;
+        } catch (error) {
+            console.error(`[upload] OpenAI Files API mirror failed for "${file.originalname}":`, error);
+            return undefined;
+        }
+    }
+
+    // Server-side substring search over a user's files. S3 has no native
+    // "contains" query, so this walks pages of the existing list() method —
+    // exactly what the plain listing already uses — filtering each page by
+    // filename as it goes, capped so one search can't turn into an unbounded
+    // scan of a huge bucket.
+    private readonly SEARCH_MAX_PAGES = 20;   // ~20,000 S3 keys scanned, worst case
+    private readonly SEARCH_MAX_RESULTS = 200;
+
+    private async searchFiles(prefix: string, search: string): Promise<ListResult["files"]> {
+        const needle = search.toLowerCase();
+        const matches: ListResult["files"] = [];
+        let token: string | undefined;
+        let pages = 0;
+
+        do {
+            const page = await this.service.list(prefix, token, { includeUrls: true });
+            for (const file of page.files) {
+                const displayName = (file.name ?? file.key).toLowerCase();
+                if (displayName.includes(needle)) {
+                    matches.push(file);
+                    if (matches.length >= this.SEARCH_MAX_RESULTS) return matches;
+                }
+            }
+            token = page.nextToken;
+            pages += 1;
+        } while (token && pages < this.SEARCH_MAX_PAGES);
+
+        return matches;
     }
 
     private async runWithConcurrency<T, R>(

@@ -13,7 +13,7 @@ export type StreamChunk = {
 
 export interface ILLM{
     chat(messages:LLMMessage[],tools:Tool[]):Promise<LLMResponse>;
-    chatStream(messages:LLMMessage[],userId:string,sessionId:string,apiKey:string):AsyncGenerator<LLMMessage,unknown,void>
+    chatStream(messages:LLMMessage[],userId:string,sessionId:string,apiKey:string,signal:AbortSignal):AsyncGenerator<LLMMessage,unknown,void>
     summarizeChat(message:any,userId:string,sessionId:string):Promise<string>
     getProvider():string;
     getModel():string;

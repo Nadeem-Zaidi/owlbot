@@ -27,7 +27,11 @@ export interface IFileStore {
   deleteFolder(path: string): Promise<void>;
   createFolder(folderName: string): Promise<void>;
   upload(files: { buffer: Buffer; originalname: string; mimetype: string }[], prefix?: string): Promise<void>;
-  uploadAndGetUrls(files: { buffer: Buffer; originalname: string; mimetype: string }[],prefix:string): Promise<{ originalname: string; key: string; url: string }[]>
+  // `options.expiresInSeconds` lets a caller ask for a longer-lived signed
+  // URL than the 1-hour default (e.g. code-interpreter-generated charts,
+  // which should stay viewable in chat history far longer than a fresh
+  // upload's share link needs to). Capped by S3 SigV4 itself at 7 days.
+  uploadAndGetUrls(files: { buffer: Buffer; originalname: string; mimetype: string }[],prefix:string, options?: { expiresInSeconds?: number }): Promise<{ originalname: string; key: string; url: string }[]>
 }
 
 export interface CodeBlock {

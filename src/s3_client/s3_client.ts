@@ -33,7 +33,8 @@ export class S3FileStore implements IFileStore {
   }
   async uploadAndGetUrls(
     files: { buffer: Buffer; originalname: string; mimetype: string }[],
-    prefix = ""
+    prefix = "",
+    options?: { expiresInSeconds?: number }
   ): Promise<{ originalname: string; key: string; url: string }[]> {
     const results: { originalname: string; key: string; url: string }[] = new Array(files.length);
     let index = 0;
@@ -54,7 +55,7 @@ export class S3FileStore implements IFileStore {
           })
         );
 
-        const url = await this.getSignedUrlFor(key);
+        const url = await this.getSignedUrlFor(key, options?.expiresInSeconds);
         results[i] = { originalname: file.originalname, key, url };
       }
     };
@@ -108,9 +109,9 @@ export class S3FileStore implements IFileStore {
     }
   }
 
-  async getSignedUrlFor(key: string): Promise<string> {
+  async getSignedUrlFor(key: string, expiresInSeconds = 3600): Promise<string> {
     return getSignedUrl(this.s3Client, new GetObjectCommand({ Bucket: this.bucket, Key: key }), {
-      expiresIn: 3600,
+      expiresIn: expiresInSeconds,
     });
   }
 

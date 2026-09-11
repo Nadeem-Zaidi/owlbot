@@ -65,7 +65,13 @@ export class VGateway {
     }
 
     public async init() {
-        this.app.use(cors());
+        // exposedHeaders — NEW. Without this, the browser's CORS policy
+        // silently hides custom response headers from JS entirely; the
+        // code interpreter file download endpoint sets X-File-Name so the
+        // frontend can show a real filename instead of the raw file_id,
+        // and fetch()'s response.headers.get("X-File-Name") would just
+        // return null across origins without this.
+        this.app.use(cors({ exposedHeaders: ["X-File-Name", "Content-Disposition"] }));
         this.app.use(verifyToken);
         this.app.use(express.json({ limit: '10mb' }));
         this.app.use(express.urlencoded({ limit: '10mb', extended: true }));

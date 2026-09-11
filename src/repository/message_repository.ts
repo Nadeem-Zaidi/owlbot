@@ -235,6 +235,7 @@ export class MessageRepository {
                     tool_call_id: row.tool_call_id,
                     name: row.name,
                     arguments: this.safeParseArgs(row.arguments, row.id, sessionId),
+                    createdAt: row.created_at,
                 } as LLMMessage,
             };
         }
@@ -247,6 +248,7 @@ export class MessageRepository {
                     type: "tool_call_output",
                     tool_call_id: row.tool_call_id,
                     output: row.output ?? "{}",
+                    createdAt: row.created_at,
                 } as LLMMessage,
             };
         }
@@ -269,7 +271,7 @@ export class MessageRepository {
         }
 
         const KNOWN_TYPES = ["text", "input_text", "output_text",
-            "input_file", "input_base64_image", "input_url_image"];
+            "input_file", "input_base64_image", "input_url_image", "code_interpreter"];
         const badParts = content.filter((p) => !KNOWN_TYPES.includes(p?.type));
 
         if (badParts.length > 0) {
@@ -291,7 +293,7 @@ export class MessageRepository {
 
         return {
             ok: true,
-            message: { role: row.role, type: "message", content } as LLMMessage,
+            message: { role: row.role, type: "message", content, createdAt: row.created_at } as LLMMessage,
         };
     }
 
