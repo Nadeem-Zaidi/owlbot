@@ -156,7 +156,15 @@ export class ChatMessages extends BaseRouter<MessageService> {
         // never reach the browser. See:
         // https://developers.openai.com/api/docs/guides/tools-code-interpreter
         this.router.get("/code_interpreter/files/:containerId/:fileId", this.asyncHandler(async (req, res) => {
-            const { containerId, fileId } = req.params;
+            // Express types route params as `string | string[]` (a route can
+            // repeat a param segment), even though :containerId/:fileId here
+            // only ever produce a single string each. Normalizing with
+            // String() (rather than destructuring req.params directly) is
+            // what tsc actually needs to allow encodeURIComponent(filename)
+            // and filename.replace(...) below — this was failing the build
+            // once it got far enough to type-check this file.
+            const containerId = req.params.containerId ? String(req.params.containerId) : "";
+            const fileId = req.params.fileId ? String(req.params.fileId) : "";
             if (!containerId || !fileId) {
                 return res.status(400).json({ message: "containerId and fileId are required" });
             }

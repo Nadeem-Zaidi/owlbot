@@ -1,5 +1,7 @@
 # ---- Build stage ----
-FROM node:20-bullseye AS build
+# pgvector@0.3.0 requires Node >=22 — node:20 produced an EBADENGINE warning
+# on every `npm ci` (harmless on its own, npm keeps going, but worth fixing).
+FROM node:22-bullseye AS build
 WORKDIR /app
 
 COPY package*.json ./
@@ -9,7 +11,7 @@ COPY . .
 RUN npm run build
 
 # ---- Runtime stage ----
-FROM node:20-bullseye-slim AS runtime
+FROM node:22-bullseye-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
