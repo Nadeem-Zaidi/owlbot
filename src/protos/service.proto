@@ -18,3 +18,25 @@ message FileResponse{
     string markdown=2;
     
 }
+
+
+// Runs owner-written Python functions for Owl Bot agents. Each call executes
+// in its own short-lived Python process with a timeout.
+service CodeRunner{
+    rpc RunPython(RunPythonRequest) returns (RunPythonResponse);
+}
+
+message RunPythonRequest{
+    string code=1;          // must define run(args, secrets)
+    string args_json=2;     // JSON object passed as `args`
+    string secrets_json=3;  // JSON object passed as `secrets`
+    int32 timeout_ms=4;
+}
+
+message RunPythonResponse{
+    bool ok=1;
+    string result_json=2;   // JSON of whatever run() returned
+    string stdout=3;        // anything the function printed
+    string error=4;         // set when ok is false
+    int32 duration_ms=5;
+}

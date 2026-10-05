@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Pool, PoolClient } from "pg";
 import { DatabaseConfig, IDatabaseAdapter, QueryResult } from "../idatabaseadapter";
 
@@ -5,7 +6,11 @@ export class PostgreSQLAdapter implements IDatabaseAdapter {
     private pool: Pool | null = null;
     private client: PoolClient | null = null;
     private config: DatabaseConfig;
+    // Manual begin/commit/rollback (used only by the migration runner at
+    // startup, before any requests are served) keeps one adapter-wide client.
     private inTransaction = false;
+    // Per-call-chain transaction client for withTransaction().
+    private txContext = new AsyncLocalStorage<PoolClient>();
 
     constructor(config: DatabaseConfig) {
         this.config = config;
@@ -64,7 +69,7 @@ export class PostgreSQLAdapter implements IDatabaseAdapter {
         }
 
         try {
-            const client = this.inTransaction && this.client ? this.client : this.pool;
+            const client = this.txContext.getStore() ?? (this.inTransaction && this.client ? this.client : this.pool);
             const result =
                 params && params.length > 0
                     ? await client.query(sql, params)
@@ -165,23 +170,39 @@ export class PostgreSQLAdapter implements IDatabaseAdapter {
     }
 
 
+    // Each call checks out its own pooled connection and binds it to the
+    // current async call chain (AsyncLocalStorage), so queries made inside
+    // `callback` use it while concurrent requests keep using the pool. The
+    // previous version stored the transaction client on the shared adapter,
+    // which pulled every other request's queries into whichever transaction
+    // happened to be open (and rolled them back with it).
     async withTransaction<T>(callback: () => Promise<T>,isolationLevel?: "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE"
     ): Promise<T> {
-        if (this.inTransaction) {
-            throw new Error(
-                "Cannot start a nested transaction. Use the existing transaction instead."
-            );
+        if (!this.pool) {
+            throw new Error("Database not connected");
         }
 
-        await this.beginTransaction(isolationLevel);
+        const existing = this.txContext.getStore();
+        if (existing) {
+            // Already inside a transaction on this call chain — join it.
+            return callback();
+        }
 
+        const client = await this.pool.connect();
         try {
-            const result = await callback();
-            await this.commit();
+            await client.query(isolationLevel ? `BEGIN ISOLATION LEVEL ${isolationLevel}` : "BEGIN");
+            const result = await this.txContext.run(client, callback);
+            await client.query("COMMIT");
             return result;
         } catch (error) {
-            await this.rollback();
+            try {
+                await client.query("ROLLBACK");
+            } catch (rollbackError) {
+                console.error("ROLLBACK failed:", rollbackError);
+            }
             throw error;
+        } finally {
+            client.release();
         }
     }
     async executeTransactionQueries<T = any>(
@@ -209,12 +230,12 @@ export class PostgreSQLAdapter implements IDatabaseAdapter {
     // ─────────────────────────────────────────────
 
     isInTransaction(): boolean {
-        return this.inTransaction;
+        return !!this.txContext.getStore() || this.inTransaction;
     }
 
     /** Returns the active PoolClient only while a transaction is open. */
     getTransactionClient(): PoolClient | null {
-        return this.inTransaction ? this.client : null;
+        return this.txContext.getStore() ?? (this.inTransaction ? this.client : null);
     }
 
     isConnected(): boolean {

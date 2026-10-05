@@ -14,7 +14,7 @@ export class  MessageService{
     }
 
     async rawDb(){
-        this.messageRepository.rawDb();
+        return this.messageRepository.rawDb();
     }
 
     async getUserSessions(userId:string):Promise<Session[]>{
@@ -22,28 +22,24 @@ export class  MessageService{
         return userSessions;
     }
 
-    async isSessionValid(sessionId:string):Promise<boolean>{
-        const id =   await this.sessionRepository.getSession(sessionId)
-        console.log(id)
-        if(!id){
-            return false
-        }
-        return true
+    // True only if the session exists AND belongs to this user.
+    async isSessionValid(sessionId:string,userId:string):Promise<boolean>{
+        const session = await this.sessionRepository.getSession(sessionId,userId)
+        return !!session
     }
 
-    async getSession(sessionId:string):Promise<Session>{
-        const valid=await this.isSessionValid(sessionId);
-        if(!valid){
+    async getSession(sessionId:string,userId:string):Promise<Session>{
+        const session=await this.sessionRepository.getSession(sessionId,userId);
+        if(!session){
             throw new InvalidSession();
         }
-        const session=await this.sessionRepository.getSession(sessionId);
         return session;
     }
 
 
 
-    async createSession(userId:string):Promise<Session>{
-        const createdSession=await this.sessionRepository.createSession(userId);
+    async createSession(userId:string, source:"web"|"whatsapp"|"pipeline"="web", title?:string):Promise<Session>{
+        const createdSession=await this.sessionRepository.createSession(userId, source, title);
         return createdSession;
     }
 

@@ -1,10 +1,8 @@
 import multer from "multer";
-import OpenAI, { toFile } from "openai";
-import { Chunk, IFileStore, ListResult } from "../interfaces/ifilestore";
+import { IFileStore, ListResult } from "../interfaces/ifilestore";
 import { BaseRouter } from "./base_router";
 import { Embedder } from "../database/vector_db/embedding";
-import { chunkMarkdown} from "../vector_db/chunking";
-import { convertFileToMarkdown } from "../protos/client";
+import { KnowledgeBase } from "../service/knowledge_base";
 
 const upload = multer({
     storage: multer.memoryStorage(),
@@ -16,36 +14,34 @@ const upload = multer({
 
 const MAX_CONCURRENT_FILE_OPS = 5;
 
-// Only spreadsheets get mirrored to OpenAI's Files API for code interpreter —
-// everything else (pdf, docx, images, txt, ...) keeps going through the
-// existing S3 + markdown-conversion + RAG indexing path unchanged. Code
-// interpreter's actual value-add is running pandas/numpy over tabular data;
-// there's no reason to also push every PDF and image through a second
-// upload just to sit unused in an OpenAI container.
-const SPREADSHEET_EXTENSIONS = new Set(["csv", "xls", "xlsx"]);
-
-function isSpreadsheetFile(filename: string): boolean {
-    const ext = filename.split(".").pop()?.toLowerCase() ?? "";
-    return SPREADSHEET_EXTENSIONS.has(ext);
-}
-
-// Lazy/optional — if OPENAI_API_KEY isn't set, spreadsheet-to-code-interpreter
-// mirroring is silently skipped (see uploadToOpenAI's catch) rather than
-// breaking uploads entirely.
-const openaiClient = process.env.OPENAI_API_KEY
-    ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-    : null;
-
-type UploadOutcome =
-    | { name: string; status: "uploaded"; url: string; openaiFileId?: string }
-    | { name: string; status: "failed"; error: string };
-
 export class StorageRoutes extends BaseRouter<IFileStore> {
-    constructor(storage: IFileStore, private embedder: Embedder) {
+    constructor(storage: IFileStore, private embedder: Embedder, private kb: KnowledgeBase) {
         super("/storage", storage);
     }
 
     registerRouter(): void {
+        // Documents indexed in the user's knowledge base (one row per file).
+        this.router.get("/documents", this.asyncHandler(async (req, res) => {
+            const documents = await this.kb.listDocuments(req.user!.sub);
+            return res.status(200).json({ documents });
+        }));
+
+        // Full text of one indexed document, for "explain this document".
+        this.router.get("/document_content", this.asyncHandler(async (req, res) => {
+            const raw = typeof req.query.key === "string" ? req.query.key : "";
+            let doc;
+            try {
+                doc = await this.kb.readDocument(req.user!.sub, raw);
+            } catch (err) {
+                return res.status(400).json({ message: err instanceof Error ? err.message : "Invalid document key" });
+            }
+            if (!doc) {
+                const name = raw.split("/").pop() || raw;
+                return res.status(404).json({ message: `"${name}" isn't in your knowledge base anymore.` });
+            }
+            return res.status(200).json(doc);
+        }));
+
         this.router.get("/list_files", this.asyncHandler(async (req, res, next) => {
             try {
                 const continuationToken = req.query.continuationToken as string | undefined;
@@ -118,7 +114,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                     const outcomes = await this.runWithConcurrency(
                         files,
                         MAX_CONCURRENT_FILE_OPS,
-                        (file) => this.uploadAndIndex(file, prefix)
+                        (file) => this.kb.ingest(file, prefix)
                     );
                     const succeeded = outcomes.filter((o) => o.status === "uploaded").length;
                     const failed = outcomes.filter((o) => o.status === "failed");
@@ -135,99 +131,6 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
         );
     }
 
-    private async uploadAndIndex(file: Express.Multer.File, prefix: string): Promise<UploadOutcome> {
-        const key = `${prefix}${file.originalname}`;
-
-        let markdown: string | null = null;
-        let markdownFilename: string | null = null;
-
-        try {
-            const result = await convertFileToMarkdown(file.originalname, file.buffer);
-            markdown = result.markdown;
-            markdownFilename = result.filename;
-        } catch (error) {
-            console.error(`[upload] markdown conversion failed for "${file.originalname}":`, error);
-            // fall through — original file still gets uploaded, just skipped for indexing
-        }
-
-        let chunks: Chunk[] = [];
-        if (markdown) {
-            chunks = chunkMarkdown(markdown, key);
-        }
-
-        let vectorIds: string[] = [];
-        if (chunks.length > 0) {
-            try {
-                vectorIds = await this.embedder.embedAndStore(chunks);
-            } catch (error) {
-                return { name: file.originalname, status: "failed", error: `Indexing failed: ${error}` };
-            }
-        }
-
-        const filesToUpload: { buffer: Buffer; originalname: string; mimetype: string }[] = [
-            { buffer: file.buffer, originalname: file.originalname, mimetype: file.mimetype },
-        ];
-
-        if (markdown && markdownFilename) {
-            filesToUpload.push({
-                buffer: Buffer.from(markdown, "utf-8"),
-                originalname: markdownFilename,
-                mimetype: "text/markdown",
-            });
-        }
-
-        try {
-            const uploaded = await this.service.uploadAndGetUrls(filesToUpload, prefix);
-            const originalFileResult = uploaded.find((u) => u.originalname === file.originalname);
-
-            let openaiFileId: string | undefined;
-            if (isSpreadsheetFile(file.originalname)) {
-                openaiFileId = await this.uploadToOpenAI(file);
-            }
-
-            return {
-                name: file.originalname,
-                status: "uploaded",
-                url: originalFileResult?.url ?? "",
-                ...(openaiFileId ? { openaiFileId } : {}),
-            };
-        } catch (error) {
-            if (vectorIds.length > 0) {
-                try {
-                    await this.embedder.deleteVectors(vectorIds);
-                } catch (cleanupError) {
-                    console.error(`[upload] failed to roll back vectors for "${key}":`, cleanupError);
-                }
-            }
-            return { name: file.originalname, status: "failed", error: `Upload failed: ${error}` };
-        }
-    }
-
-    // Mirrors a spreadsheet to OpenAI's Files API so the code interpreter
-    // container can later be given its file_id and actually read it —
-    // uploading to S3 alone (uploadAndGetUrls above) only produces a link,
-    // which the container has no way to fetch. Failure here is deliberately
-    // non-fatal: the S3 upload and RAG indexing already succeeded by the
-    // time this runs, so a hiccup with OpenAI (missing key, transient
-    // network error) should degrade to "code interpreter can't see this
-    // file yet" rather than failing the whole upload.
-    private async uploadToOpenAI(file: Express.Multer.File): Promise<string | undefined> {
-        if (!openaiClient) {
-            console.warn(`[upload] OPENAI_API_KEY not set — skipping code-interpreter mirror for "${file.originalname}"`);
-            return undefined;
-        }
-        try {
-            const uploadableFile = await toFile(file.buffer, file.originalname, { type: file.mimetype });
-            const created = await openaiClient.files.create({
-                file: uploadableFile,
-                purpose: "assistants",
-            });
-            return created.id;
-        } catch (error) {
-            console.error(`[upload] OpenAI Files API mirror failed for "${file.originalname}":`, error);
-            return undefined;
-        }
-    }
 
     // Server-side substring search over a user's files. S3 has no native
     // "contains" query, so this walks pages of the existing list() method —
@@ -258,6 +161,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
 
         return matches;
     }
+
 
     private async runWithConcurrency<T, R>(
         items: T[],

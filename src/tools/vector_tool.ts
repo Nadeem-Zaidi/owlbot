@@ -31,6 +31,11 @@ export class EmbedderAdapter implements EmbeddingProvider {
 
 const MAX_LIMIT = 20;
 const DEFAULT_LIMIT = 5;
+// Relevance cut-offs (cosine similarity, text-embedding-3-small). Measured on
+// real documents: on-topic chunks score ~0.4–0.7, unrelated ones ~0.1–0.2.
+// Tune per corpus with KB_MIN_SCORE / KB_RELATIVE_MARGIN.
+const MIN_SCORE = Number(process.env.KB_MIN_SCORE ?? 0.3);
+const RELATIVE_MARGIN = Number(process.env.KB_RELATIVE_MARGIN ?? 0.2);
 
 /**
  * The core RAG retrieval tool: the model gives you a natural-language
@@ -40,14 +45,18 @@ const DEFAULT_LIMIT = 5;
  * it needs the live vectorDb + embedder injected, which the file-based
  * DynamicToolLoader has no way to do.
  */
-export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProvider): ToolDefinition {
+// `documentKeys` limits an agent to specific documents; results are always
+// limited to the calling user's own folder (ctx.userId).
+export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProvider, documentKeys: string[] = []): ToolDefinition {
   return {
     name: "search_knowledge_base",
     description:
       "Semantic search over the indexed document store. Use this whenever the user asks about " +
       "content that might live in ingested documents rather than general knowledge — e.g. " +
       "'what does our doc say about X', 'find the section on Y'. Returns the most relevant chunks " +
-      "with their source file, heading, and text. Always cite source_file when quoting a result.",
+      "with their source file, heading, and text. Always cite source_file when quoting a result. " +
+      "Only relevant chunks are returned; if `results` is empty, the documents don't cover the " +
+      "topic — say so plainly and don't cite any document for it.",
     parameters: {
       type: "object",
       properties: {
@@ -62,7 +71,7 @@ export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProv
       },
       required: ["query"],
     },
-    execute: async (args: Record<string, any>, _ctx: ToolContext) => {
+    execute: async (args: Record<string, any>, ctx: ToolContext) => {
       const query = typeof args.query === "string" ? args.query.trim() : "";
       if (!query) {
         throw new Error("`query` is required and must be a non-empty string.");
@@ -71,10 +80,20 @@ export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProv
       const limit = Math.min(Math.max(Number(args.limit) || DEFAULT_LIMIT, 1), MAX_LIMIT);
 
       const vector = await embed.embed(query);
-      const results = await vectorDb.search(vector, limit, true);
+      if (!ctx.userId) throw new Error("Knowledge base search needs a signed-in user.");
+      const results = await vectorDb.search(vector, limit, true, {
+        prefix: `${ctx.userId}/`,
+        sourceFiles: documentKeys.length ? documentKeys : undefined,
+        text: query,
+        minScore: MIN_SCORE,
+        relativeMargin: RELATIVE_MARGIN,
+      });
 
       if (results.length === 0) {
-        return { results: [], note: "No matching chunks found in the knowledge base for this query." };
+        return {
+          results: [],
+          note: "Nothing in the knowledge base is relevant to this query. Tell the user their documents don't cover it; do not cite any document.",
+        };
       }
 
       return {
@@ -82,11 +101,6 @@ export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProv
           source_file: r.payload?.source_file,
           heading: r.payload?.heading,
           score: Number(r.score.toFixed(4)),
-          // NEW — reads the dedicated `content` column now that
-          // PostgresqlVectorDb actually stores it (see
-          // postgresql_vector_db_patched.ts). Requires VectorSearchResult's
-          // payload type to add `content: string` alongside source_file/
-          // heading/metadata in your ivector.ts interface file.
           content: (r.payload as any)?.content ?? null,
         })),
       };

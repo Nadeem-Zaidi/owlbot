@@ -64,41 +64,11 @@ export class MessageRepository {
     }
 
     async insertLLMMessage(sessionId: string, message: LLMMessage): Promise<void> {
-
-
         try {
-             await this.db.query(
-                `INSERT INTO chat_messages (session_id, role, type, content, name,arguments, tool_call_id, output
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-                [
-                    sessionId,
-                    message.role ?? null,
-                    message.type ?? null,
-                    // FIX: previously a plain string was stored as-is (raw, unwrapped
-                    // text), which sanitizeRow's JSON.parse(row.content) can never
-                    // parse back — every such row was permanently marked corrupt.
-                    // Now a plain string gets wrapped into the expected
-                    // ContentPart[] shape before being stringified, same as any
-                    // other content value.
-                    message.content
-                        ? (typeof message.content === 'string'
-                            ? JSON.stringify([{ type: "text", text: message.content }])
-                            : JSON.stringify(message.content))
-                        : null,
-                    message.name ?? null,
-                    message.arguments ? JSON.stringify(message.arguments) : null,
-                    message.tool_call_id ?? null,
-                    // FIX: message.output is already a plain string in practice
-                    // (e.g. the JSON.stringify'd tool result built in
-                    // openai_provider.ts). JSON.stringify-ing it again here would
-                    // double-encode it, and sanitizeRow's read side never decodes
-                    // it back — so store it as-is when it's already a string, and
-                    // only stringify non-string values.
-                    message.output != null
-                        ? (typeof message.output === 'string' ? message.output : JSON.stringify(message.output))
-                        : null,
-                ]
-            );
+            await this.db.withTransaction(async () => {
+                await this.insertRow(sessionId, message);
+                await this.touchSession(sessionId);
+            });
         } catch (err) {
             log.error({ err, sessionId, role: message.role }, "failed to insert LLM message");
             throw err;
@@ -112,8 +82,9 @@ export class MessageRepository {
         try {
             await this.db.withTransaction(async () => {
                 for (const message of messages) {
-                    await this.insertLLMMessage(sessionId,message)
+                    await this.insertRow(sessionId, message);
                 }
+                await this.touchSession(sessionId);
             });
 
             log.info({
@@ -127,6 +98,51 @@ export class MessageRepository {
         }
     }
 
+    // Single place that decides how each column is encoded.
+    private async insertRow(sessionId: string, message: LLMMessage): Promise<void> {
+        await this.db.query(
+            `INSERT INTO chat_messages (session_id, role, type, content, name, arguments, tool_call_id, output, metadata
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+            [
+                sessionId,
+                message.role ?? null,
+                message.type ?? null,
+                // A plain string is wrapped into the ContentPart[] shape that
+                // sanitizeRow expects to read back.
+                message.content
+                    ? (typeof message.content === 'string'
+                        ? JSON.stringify([{ type: "text", text: message.content }])
+                        : JSON.stringify(message.content))
+                    : null,
+                message.name ?? null,
+                message.arguments ? JSON.stringify(message.arguments) : null,
+                message.tool_call_id ?? null,
+                MessageRepository.toJsonb(message.output),
+                message.metadata ? JSON.stringify(message.metadata) : null,
+            ]
+        );
+    }
+
+    // `output` is a JSONB column. Tool results are usually already a JSON
+    // string (store as-is so it isn't double-encoded), but a tool may return
+    // plain text such as "No results", which Postgres would reject as JSON —
+    // encode that as a JSON string instead.
+    private static toJsonb(value: unknown): string | null {
+        if (value == null) return null;
+        if (typeof value !== "string") return JSON.stringify(value);
+        try {
+            JSON.parse(value);
+            return value;
+        } catch {
+            return JSON.stringify(value);
+        }
+    }
+
+    // Keeps the sidebar's "Recents" ordered by latest activity.
+    private async touchSession(sessionId: string): Promise<void> {
+        await this.db.query(`UPDATE sessions SET updated_at = NOW() WHERE id = $1`, [sessionId]);
+    }
+
     async saveConversation(
         sessionId: string,
         messages: LLMMessage[]
@@ -135,15 +151,14 @@ export class MessageRepository {
 
         try {
             await this.db.withTransaction(async () => {
-                // Optionally clear existing messages for this session
                 await this.db.query(
                     `DELETE FROM chat_messages WHERE session_id = $1`,
                     [sessionId]
                 );
-                // place that decides how content/output get encoded.
                 for (const message of messages) {
-                    await this.insertLLMMessage(sessionId, message);
+                    await this.insertRow(sessionId, message);
                 }
+                await this.touchSession(sessionId);
             });
 
             log.info({
@@ -293,7 +308,7 @@ export class MessageRepository {
 
         return {
             ok: true,
-            message: { role: row.role, type: "message", content, createdAt: row.created_at } as LLMMessage,
+            message: { role: row.role, type: "message", content, createdAt: row.created_at, ...(row.metadata ? { metadata: row.metadata } : {}) } as LLMMessage,
         };
     }
 
@@ -315,9 +330,15 @@ export class MessageRepository {
         return { ok: false, reason, message };
     }
 
-    private safeParseArgs(raw: string, rowId: number, sessionId: string): Record<string, any> {
+    // pg already decodes JSONB columns into objects; only a legacy row stored
+    // as a JSON *string* needs parsing. (Calling JSON.parse on the decoded
+    // object used to throw, so every reloaded tool call lost its arguments.)
+    private safeParseArgs(raw: unknown, rowId: number, sessionId: string): Record<string, any> {
+        if (raw == null) return {};
+        if (typeof raw === "object") return raw as Record<string, any>;
         try {
-            return JSON.parse(raw);
+            const parsed = JSON.parse(String(raw));
+            return parsed && typeof parsed === "object" ? parsed : {};
         } catch {
             log.warn({ rowId, sessionId }, "tool_call arguments JSON parse failed");
             return {};

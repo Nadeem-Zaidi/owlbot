@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { createHash } from "node:crypto";
 import dotenv from "dotenv";
 import { IVectorDb } from "../../interfaces/vectordb/ivector";
 import { Chunk, IFileStore } from "../../interfaces/ifilestore";
@@ -8,6 +9,10 @@ dotenv.config();
 const EMBEDDING_MODEL = "text-embedding-3-small";
 const PIPELINE_BATCH = 30;
 const DEFAULT_READ_TIMEOUT_MS = 3000;
+// The embeddings endpoint takes up to 2048 inputs / 8192 tokens each; stay
+// well under both so one big document doesn't fail as a single request.
+const EMBED_BATCH = 64;
+const MAX_INPUT_CHARS = 24_000;
 
 export class Embedder {
     private client: OpenAI;
@@ -42,15 +47,26 @@ export class Embedder {
 
     async embedBatch(chunks: Chunk[]): Promise<number[][]> {
         const inputs = chunks.map((c) => this.chunkToText(c));
-        const res = await this.client.embeddings.create({
-            model: this.model,
-            input: inputs,
-        });
-        return res.data.map((d) => d.embedding);
+        const vectors: number[][] = [];
+        for (let i = 0; i < inputs.length; i += EMBED_BATCH) {
+            const res = await this.client.embeddings.create({
+                model: this.model,
+                input: inputs.slice(i, i + EMBED_BATCH),
+            });
+            // The API returns one item per input, tagged with its index.
+            for (const d of [...res.data].sort((a, b) => a.index - b.index)) vectors.push(d.embedding);
+        }
+        return vectors;
     }
 
+    // What actually gets embedded. Naming the document and the full heading
+    // path anchors each chunk to its topic, so a bare paragraph like "Click
+    // Save to finish" isn't a near-match for every "how do I save" question.
     private chunkToText(chunk: Chunk): string {
-        let text = "";
+        const docName = (chunk.sourceFile.split("/").pop() ?? chunk.sourceFile)
+            .replace(/\.[^.]+$/, "")
+            .replace(/[_-]+/g, " ");
+        let text = `Document: ${docName}\n`;
         if (chunk.heading) {
             text += `Section: ${chunk.heading}\n`;
         }
@@ -58,13 +74,13 @@ export class Embedder {
         for (const cb of chunk.codeBlocks) {
             text += `\nCode (${cb.lang}):\n${cb.value}\n`;
         }
-        return text.trim();
+        return text.trim().slice(0, MAX_INPUT_CHARS);
     }
 
     async embedText(text: string): Promise<number[]> {
         const res = await this.client.embeddings.create({
             model: this.model,
-            input: text,
+            input: text.slice(0, MAX_INPUT_CHARS),
         });
         return res.data[0].embedding;
     }
@@ -146,15 +162,13 @@ export class Embedder {
 
 }
 
+// Content hash → UUID-shaped id. Same chunk re-indexed = same row (upsert),
+// and sha256 makes two different chunks sharing an id practically impossible.
 function stableId(chunk: Chunk): string {
     const raw =
         `${chunk.sourceFile}::${chunk.heading}::${chunk.level}::${chunk.content}` +
         `::${chunk.tables.map((t) => t.headers.join(",") + t.rows.map((r) => r.join(",")).join(";")).join("|")}` +
         `::${chunk.codeBlocks.map((c) => c.lang + c.value).join("|")}`;
-    let hash = 5381;
-    for (let i = 0; i < raw.length; i++) {
-        hash = ((hash << 5) + hash) ^ raw.charCodeAt(i);
-        hash = hash >>> 0;
-    }
-    return `${hash.toString(16).padStart(8, "0")}-${raw.length.toString(16).padStart(4, "0")}-0000-0000-000000000000`;
+    const h = createHash("sha256").update(raw).digest("hex");
+    return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20, 32)}`;
 }

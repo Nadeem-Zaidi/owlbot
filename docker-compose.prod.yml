@@ -1,0 +1,141 @@
+# Scaled production stack:
+#
+#   nginx (load balancer :80) ──► api × N  (stateless; each runs CLUSTER_WORKERS processes)
+#                              └► jobs × 1 (WhatsApp + scheduler; /api/whatsapp/* goes here)
+#   api/jobs ──► pgbouncer ──► postgres (pgvector)      api/jobs ──► redis (rate limits, approvals)
+#   api/jobs ──► converter (Python gRPC: documents → Markdown, code functions)
+#
+# Start:   docker compose -f docker-compose.prod.yml up -d --build
+# Scale:   API_REPLICAS=6 docker compose -f docker-compose.prod.yml up -d --scale api=6
+# Secrets come from .env (never baked into images). Required in production:
+#   AGENT_SECRETS_KEY (same on every instance), FIREBASE_SERVICE_ACCOUNT_BASE64,
+#   CORS_ORIGINS, POSTGRES_* and your provider API keys.
+# The web app (owlbot_frontend) is static: host it on a CDN or its own nginx.
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: owlbot-api:latest
+  restart: unless-stopped
+  # Longer than the app's shutdown grace (25 s) so streaming replies can finish.
+  stop_grace_period: 30s
+  env_file:
+    - .env
+  environment: &app-env
+    NODE_ENV: production
+    PORT: "3000"
+    POSTGRES_HOST: pgbouncer
+    POSTGRES_PORT: "6432"
+    # pgbouncer multiplexes; keep per-process pools small.
+    PG_POOL_MAX: "10"
+    REDIS_URL: redis://redis:6379
+    GRPC_SERVER_ADDRESS: converter:50051
+    TRUST_PROXY: "loopback, linklocal, uniquelocal"
+  depends_on:
+    pgbouncer:
+      condition: service_started
+    redis:
+      condition: service_healthy
+    converter:
+      condition: service_started
+
+services:
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      CLUSTER_WORKERS: ${API_WORKERS:-2}
+      # Single-instance jobs run in the "jobs" service instead.
+      WHATSAPP_ENABLED: "false"
+      SCHEDULER_ENABLED: "false"
+    deploy:
+      replicas: ${API_REPLICAS:-3}
+    expose:
+      - "3000"
+
+  jobs:
+    <<: *app
+    environment:
+      <<: *app-env
+      CLUSTER_WORKERS: "1"
+      WHATSAPP_ENABLED: ${WHATSAPP_ENABLED:-false}
+      SCHEDULER_ENABLED: "true"
+    volumes:
+      - whatsapp_auth:/app/auth_state
+    expose:
+      - "3000"
+
+  nginx:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+      - jobs
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Rate-limit counters and short-lived approvals: keep them, never evict.
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: unless-stopped
+    environment:
+      DB_HOST: ${PGBOUNCER_DB_HOST:-postgres}
+      DB_PORT: ${PGBOUNCER_DB_PORT:-5432}
+      DB_USER: ${POSTGRES_USERNAME}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DATABASE}
+      AUTH_TYPE: scram-sha-256
+      # Transaction pooling: thousands of client connections → a few dozen to Postgres.
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: "5000"
+      DEFAULT_POOL_SIZE: ${PG_POOL_SIZE:-40}
+      LISTEN_PORT: "6432"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Remove this service and set PGBOUNCER_DB_HOST to use a managed Postgres
+  # (RDS, Cloud SQL, Neon…) — it needs the "vector" extension.
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    command: ["postgres", "-c", "max_connections=200", "-c", "shared_buffers=512MB"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME} -d ${POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  converter:
+    build:
+      context: ${CONVERTER_PATH:-../../python_prac/owlbot}
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "50051"
+
+volumes:
+  pgdata:
+  redis_data:
+  whatsapp_auth:

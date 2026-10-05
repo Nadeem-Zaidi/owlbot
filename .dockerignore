@@ -1,0 +1,12 @@
+# Never bake secrets or local state into images — pass them as environment.
+.env
+.env.*
+!.env.example
+**/serviceAccountKey.json
+.agent_secrets_key
+auth_state/
+node_modules/
+dist/
+*.log
+.git/
+docs/

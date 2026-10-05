@@ -51,12 +51,21 @@ export const verifyToken = async (req: Request, res: Response, next: NextFunctio
     }
 
 
+    let decoded: DecodedIdToken;
     try {
-        const decoded = await firebaseAdmin.auth().verifyIdToken(token);
-        req.user = decoded;
-        req.prefix=`nadeem-bucket-9891/${decoded.uid}/`
-        next();
+        decoded = await firebaseAdmin.auth().verifyIdToken(token);
     } catch (error) {
         return res.status(401).json({ error: "Invalid or expired token" });
     }
+    // Sign-up isn't finished until a phone number is verified; enforce it here
+    // too, not just in the web app. Set REQUIRE_VERIFIED_PHONE=false to allow
+    // accounts without one.
+    if (REQUIRE_VERIFIED_PHONE && !decoded.phone_number) {
+        return res.status(403).json({ error: "Verify your phone number to finish signing up", message: "Verify your phone number to finish signing up" });
+    }
+    req.user = decoded;
+    req.prefix=`nadeem-bucket-9891/${decoded.uid}/`
+    next();
 };
+
+const REQUIRE_VERIFIED_PHONE = process.env.REQUIRE_VERIFIED_PHONE !== "false";

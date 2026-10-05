@@ -8,6 +8,8 @@ import { IDatabaseAdapter } from "../database/idatabaseadapter";
 
 export interface ToolContext {
     db: IDatabaseAdapter;
+    // Who the tool runs for — tools must only touch this user's data.
+    userId?: string;
 }
 
 export interface ToolDefinition {

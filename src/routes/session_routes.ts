@@ -5,15 +5,49 @@ import { BaseRouter } from "./base_router";
 import { MessageService } from "../service/message_service";
 import { ILLM } from "../interfaces/illm";
 import { LLMMessage } from "../types/llm_message";
+import { LLMProvider } from "../llms/llm_factory";
+import { AgentService } from "../service/agents/agent_service";
+import { ChatRunOptions } from "../interfaces/illm";
+import { NativeAgentService } from "../service/native_agents/native_agent_service";
+import { KnowledgeBase } from "../service/knowledge_base";
+import { withAttachmentText } from "../service/attachment_text";
+import { BillingService } from "../service/billing/billing_service";
 dotenv.config();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 
-export class ChatMessages extends BaseRouter<MessageService> {
-    llm: ILLM;
+const PROVIDER_LABELS: Partial<Record<LLMProvider, string>> = {
+    openai: "ChatGPT",
+    anthropic: "Claude",
+};
 
-    constructor(messsageService: MessageService, llm: ILLM) {
+// "claude-sonnet-5-5" → "Claude Sonnet 5.5", "gpt-4o-mini" → "GPT-4o mini".
+// Anything unrecognised is shown as its raw id.
+function modelLabel(id: string): string {
+    const claude = id.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/);
+    if (claude) {
+        const [, family, major, minor] = claude;
+        return `Claude ${family[0].toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ""}`;
+    }
+    if (id.startsWith("gpt-")) return `GPT-${id.slice(4).replace(/-/g, " ")}`;
+    return id;
+}
+
+export class ChatMessages extends BaseRouter<MessageService> {
+    providers: Map<LLMProvider, ILLM>;
+    defaultProvider: LLMProvider;
+
+    agents?: AgentService;
+    nativeAgents?: NativeAgentService;
+    kb?: KnowledgeBase;
+    billing?: BillingService;
+
+    constructor(messsageService: MessageService, providers: Map<LLMProvider, ILLM>, defaultProvider: LLMProvider, agents?: AgentService, nativeAgents?: NativeAgentService, kb?: KnowledgeBase) {
         super("/session", messsageService)
-        this.llm = llm
+        this.providers = providers
+        this.defaultProvider = defaultProvider
+        this.agents = agents
+        this.nativeAgents = nativeAgents
+        this.kb = kb
     }
     registerRouter() {
         this.router.get("/messages", this.asyncHandler(async (req, res) => {
@@ -22,11 +56,23 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
         }));
 
+        // Lists the providers that have an API key configured, so the UI's
+        // model picker only offers ones that will actually work.
+        this.router.get("/providers", this.asyncHandler(async (req, res) => {
+            const providers = [...this.providers.entries()].map(([id, llm]) => ({
+                id,
+                label: PROVIDER_LABELS[id] ?? id,
+                defaultModel: llm.getModel(),
+                models: (llm.getModels?.() ?? [llm.getModel()]).map((m) => ({ id: m, label: modelLabel(m) })),
+            }));
+            return res.status(200).json({ providers, defaultProvider: this.defaultProvider });
+        }));
+
         this.router.get("/get_session/:sessionId", this.asyncHandler(async (req, res) => {
             const { sessionId } = req.params; 
             try {
                 if (!sessionId) throw new InvalidSession();
-                const id = await this.service.getSession(sessionId as string);
+                const id = await this.service.getSession(sessionId as string, req.user!.sub);
                 return res.status(200).json(id);
             } catch (err) {
                 throw err;
@@ -40,7 +86,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
             if (!sessionId) throw new InvalidSession();
 
-            const isSessionValid: boolean = await this.service.isSessionValid(sessionId as string);
+            const isSessionValid: boolean = await this.service.isSessionValid(sessionId as string, req.user!.sub);
             if (!isSessionValid) throw new SessionValidationError();
 
             const sessions = await this.service.loadMessages(sessionId as string);
@@ -72,7 +118,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 throw new InvalidSession();
             }
 
-            const isSessionValid: boolean = await this.service.isSessionValid(sessionId as string);
+            const isSessionValid: boolean = await this.service.isSessionValid(sessionId as string, req.user!.sub);
             if (!isSessionValid) {
                 throw new SessionValidationError();
             }
@@ -86,9 +132,52 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
 
         this.router.post("/chat_stream", this.asyncHandler(async (req, res) => {
-            const { llmMessage, currentSessionId }: { llmMessage: LLMMessage, currentSessionId: any} = req.body;
+            const { llmMessage: rawMessage, currentSessionId, provider, model: requestedModel, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: LLMProvider, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
+            let model = requestedModel;
             if (!currentSessionId) {
                 throw new InvalidSession()
+            }
+            // Never read or append to another user's conversation.
+            if (!(await this.service.isSessionValid(String(currentSessionId), req.user!.sub))) {
+                throw new SessionValidationError();
+            }
+            void this.billing?.rememberUser(req.user!.sub, req.user!.email);
+            // Attached Word/Excel/PowerPoint/text files: include their extracted text.
+            const llmMessage = this.kb && rawMessage ? await withAttachmentText(rawMessage, req.user!.sub, this.kb) : rawMessage;
+            let llm = this.providers.get(provider ?? this.defaultProvider);
+            if (!llm) {
+                throw new ValidationError(`LLM provider "${provider}" is not available`);
+            }
+            // Only allow models configured for this provider — the client can't
+            // pick an arbitrary (possibly expensive) model.
+            if (model && !(llm.getModels?.() ?? [llm.getModel()]).includes(model)) {
+                throw new ValidationError(`Model "${model}" is not available for ${llm.getProvider()}`);
+            }
+
+            // A chat that belongs to an agent (or the first message of a new
+            // agent chat) runs with that agent's model, instructions and tools.
+            let run: ChatRunOptions | undefined;
+            // A chat with a provider-native agent runs on Claude Managed Agents /
+            // the OpenAI Agents API instead of this server's own loop.
+            const native = this.nativeAgents
+                ? await this.nativeAgents.agentForSession(String(currentSessionId), req.user!.sub, typeof nativeAgentId === "string" ? nativeAgentId : undefined)
+                    .catch((err) => { if (err?.status === 409) return { blocked: String(err.message) } as const; throw err; })
+                : null;
+            if (native && "blocked" in native) {
+                res.write(`event: error\ndata: ${JSON.stringify({ type: "error", message: native.blocked })}\n\n`);
+                return res.end();
+            }
+            if (native) {
+                llm = this.nativeAgents!.llmFor(native.agent, native.remoteSessionId);
+                model = native.agent.model;
+            } else if (this.agents) {
+                const agent = await this.agents.agentForSession(String(currentSessionId), req.user!.sub, agentId);
+                if (agent) {
+                    const resolved = this.agents.resolveLLM(agent);
+                    llm = resolved.llm;
+                    model = resolved.model;
+                    run = await this.agents.buildRun(agent);
+                }
             }
             const abortController= new AbortController();
             // FIX — this used to listen on req.on("close"), which fires as
@@ -128,9 +217,13 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 "code_interpreter_call_code_done",
                 "code_interpreter_call_status",
                 "code_interpreter_file",
+                "usage",
+                "approval_request",
+                "approval_resolved",
+                "browser_screenshot",
             ]);
 
-            for await (const chunk of this.llm.chatStream([llmMessage], req.user!.sub, currentSessionId,OPENAI_API_KEY,abortController.signal)) {
+            for await (const chunk of llm.chatStream([llmMessage], req.user!.sub, currentSessionId,OPENAI_API_KEY,abortController.signal,model,run)) {
                 // NEW — this used to be a switch with one hardcoded case per
                 // event type. Every type the provider yields that wasn't
                 // listed there (mcp_*, sources, cancelled, and now the new

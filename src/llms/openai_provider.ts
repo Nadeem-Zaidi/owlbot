@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import type { ResponseFunctionToolCall, ResponseInputFile, ResponseInputImage, ResponseInputItem, ResponseInputText, ResponseOutputText } from "openai/resources/responses/responses";
-import { ILLM } from "../interfaces/illm";
+import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool, ToolCall } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
 import { LLMConfig } from "../types/lmconfig";
@@ -8,6 +8,9 @@ import { LLMTool } from "../tools/tool_registry";
 import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
 import { IFileStore } from "../interfaces/ifilestore";
+import { windowHistory } from "./history_window";
+import { usageIncrement } from "./usage_tracking";
+import { TokenCounts } from "../repository/usage_repository";
 
 
 
@@ -55,11 +58,16 @@ export class OpenAIProvider implements ILLM {
                                         text: (msg as TextContent).text
                                     } as ResponseInputText;
 
-                                case "input_file":
-                                    return {
-                                        type: "input_file",
-                                        file_url: (msg as FileInput).fileUrl
-                                    } as ResponseInputFile;
+                                case "input_file": {
+                                    // OpenAI reads PDFs from a URL; other documents reach the
+                                    // model as their extracted text (attachment_text.ts).
+                                    const file = msg as FileInput;
+                                    const name = file.fileName ?? "file";
+                                    if ((file.fileExtension ?? name).toLowerCase().endsWith("pdf") && file.fileUrl) {
+                                        return { type: "input_file", file_url: file.fileUrl } as ResponseInputFile;
+                                    }
+                                    return { type: "input_text", text: `[Attached file: ${name}]` } as ResponseInputText;
+                                }
 
                                 case "input_base64_image":
                                     return {
@@ -84,10 +92,6 @@ export class OpenAIProvider implements ILLM {
                     };
 
                 case "assistant": {
-                    // "code_interpreter" parts are UI-only (streamed code + generated
-                    // files, kept so the frontend can replay history) — they aren't a
-                    // valid Responses API input content type, so they must never be
-                    // handed back to the model when a saved conversation is replayed.
                     const assistantParts = (m.content as ContentPart[]).filter((msg) => msg.type !== "code_interpreter");
                     const partsToSend = assistantParts.length ? assistantParts : [{ type: "output_text", text: "" } as TextContent];
                     return {
@@ -166,6 +170,11 @@ export class OpenAIProvider implements ILLM {
     }
 
     async summarizeChat(message: ResponseInputItem[]): Promise<string> {
+        return (await this.generateTitle(message)).title;
+    }
+
+    // Also returns the tokens it used, so chatStream can report them.
+    private async generateTitle(message: ResponseInputItem[]): Promise<{ title: string; usage?: TokenCounts; model?: string }> {
         const promptMessage: ResponseInputItem = {
             type: "message",
             role: "system",
@@ -214,45 +223,43 @@ export class OpenAIProvider implements ILLM {
                 temperature: 0.3,
                 max_output_tokens: 20,
             });
-            console.log(response.output_text?.trim())
-            return response.output_text?.trim() || "New Conversation";
+            return { title: response.output_text?.trim() || "New Conversation", usage: openaiUsage(response.usage), model: response.model };
 
         } catch (error) {
             console.error("Failed to generate title:", error);
-            return "New Conversation";
+            return { title: "New Conversation" };
         }
 
     }
-    async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, apiKey: string,signal:AbortSignal): AsyncGenerator<LLMMessage, void, unknown> {
+    async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, apiKey: string, signal: AbortSignal, model?: string, run?: ChatRunOptions): AsyncGenerator<LLMMessage, void, unknown> {
+        const activeModel = model ?? this.config.model;
+        const toolset: ToolSource = run?.tools ?? this.tools;
         await this.messageService.runTransaction(sessionId, messages);
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
-        const parseUserSessionMessages = this.fromInput(userSessionMessages);
+        // Only the newest part of a long chat is sent; the full history stays stored.
+        const parseUserSessionMessages = this.fromInput(windowHistory(userSessionMessages));
         let inputMessages = [...parseUserSessionMessages];
-        const mcpTools = this.getMcpServerConfigs().map((server) => ({
+        if (run?.systemPrompt) {
+            inputMessages = [
+                { type: "message", role: "system", content: [{ type: "input_text", text: run.systemPrompt }] } as ResponseInputItem,
+                ...inputMessages,
+            ];
+        }
+        // Agents bring their own MCP servers (as function tools), so the
+        // env-configured hosted ones are only used for plain chats.
+        const mcpTools = (run ? [] : this.getMcpServerConfigs()).map((server) => ({
             type: "mcp",
             server_label: server.label,
             server_url: server.url,
             require_approval: server.requireApproval ?? "never",
             ...(server.allowedTools ? { allowed_tools: server.allowedTools } : {}),
         }));
-        const functionTools = this.tools.getAll().map((def) => ({
+        const functionTools = toolset.getAll().map((def) => ({
             type: "function",
             name: def.name,
             description: def.description,
             parameters: def.parameters,
         }));
-
-        // Code interpreter's container only sees files explicitly attached to
-        // it via `file_ids` — the `input_file` parts built in fromInput() carry
-        // only an S3 file_url, which the container can't read. storage_routes.ts
-        // now additionally uploads spreadsheets (csv/xls/xlsx only — everything
-        // else keeps going through the existing S3 + RAG path unchanged) to
-        // OpenAI's Files API and stamps the resulting id onto that same
-        // content part as `openaiFileId`. Re-derived from the full history
-        // (not just the latest message) on every call since this provider
-        // resends the whole conversation each turn with no server-side
-        // container reuse — a spreadsheet uploaded three turns ago still
-        // needs to be re-attached for the model to reference it now.
         const spreadsheetFileIds = Array.from(new Set(
             userSessionMessages.flatMap((m) => {
                 if (m.role !== "user" || !Array.isArray(m.content)) return [];
@@ -261,22 +268,14 @@ export class OpenAIProvider implements ILLM {
                     .map((part) => part.openaiFileId as string);
             })
         ));
-
-        // Recomputed on every fetch attempt (not just once) because a
-        // reused container can turn out to be stale — see the
-        // "container looks invalid/expired" retry below, which flips
-        // forceFreshContainer and re-enters the loop needing a fresh
-        // `type: "auto"` + file_ids build instead of the reused id.
         let forceFreshContainer = false;
         const buildCodeInterpreterTools = () => {
-            if (!this.enableCodeInterpreter) return [];
+            if (!(run?.codeInterpreter ?? this.enableCodeInterpreter)) return [];
             const reusable = !forceFreshContainer ? this.findReusableContainer(userSessionMessages) : null;
             const canReuse = !!reusable && reusable.ageMs < this.CONTAINER_REUSE_WINDOW_MS;
             return [{
                 type: "code_interpreter",
                 container: canReuse
-                    // Reusing the same container means the files it already has
-                    // are still there — no need to resend file_ids at all.
                     ? reusable!.containerId
                     : {
                         type: "auto",
@@ -289,6 +288,9 @@ export class OpenAIProvider implements ILLM {
         const collectedSources = new Set<string>();
         const collectedCodeFiles: Array<{ file_id: string; container_id: string; filename?: string; url?: string }> = [];
         const collectedCodeFileKeys = new Set<string>();
+
+        // Text streamed for the current output item — saved if the user presses Stop.
+        let pendingText = "";
 
         let continueLoop = true;
         while (continueLoop) {
@@ -306,7 +308,7 @@ export class OpenAIProvider implements ILLM {
                         "Authorization": `Bearer ${apiKey}`,
                     },
                     body: JSON.stringify({
-                        model: this.config.model,
+                        model: activeModel,
                         input: inputMessages,
                         max_output_tokens: this.config.maxTokens,
                         temperature: this.config.temperature,
@@ -318,7 +320,7 @@ export class OpenAIProvider implements ILLM {
 
                 if (!res.ok) {
                     let errBody: any = null;
-                    try { errBody = await res.json(); } catch {  }
+                    try { errBody = await res.json(); } catch { }
                     const message = errBody?.error?.message ?? `HTTP ${res.status}`;
                     console.error(`[OpenAIProvider] OpenAI responses API returned ${res.status}:`, JSON.stringify(errBody ?? message));
                     const reusedContainerLooksExpired =
@@ -361,6 +363,8 @@ export class OpenAIProvider implements ILLM {
                 while (true) {
                     if (signal.aborted) {
                         await reader.cancel();
+                        await this.savePartialReply(sessionId, pendingText, activeModel);
+                        pendingText = "";
                         continueLoop = false;
                         break;
                     }
@@ -389,6 +393,7 @@ export class OpenAIProvider implements ILLM {
                         }
 
                         if (event.type === "response.output_text.delta") {
+                            pendingText += event.delta ?? "";
                             yield {
                                 type: "message",
                                 role: "assistant",
@@ -397,6 +402,7 @@ export class OpenAIProvider implements ILLM {
                         }
 
                         if (event.type === "response.output_text.done") {
+                            pendingText = "";
                             try {
                                 const codeInterpreterParts: ContentPart[] = [...codeInterpreterCalls.values()].map((call) => ({
                                     type: "code_interpreter",
@@ -411,11 +417,14 @@ export class OpenAIProvider implements ILLM {
                                     role: "assistant",
                                     content: [{ type: "output_text", text: event.text }, ...codeInterpreterParts],
                                     sources: collectedSources.size ? Array.from(collectedSources) : undefined,
+                                    metadata: { provider: "openai", model: activeModel },
                                 };
                                 await this.messageService.createLLMMessage(sessionId, assistantMessage);
                                 inputMessages = [...inputMessages, ...this.fromInput([assistantMessage])];
                                 if ([1, 2, 3, 4].includes(inputMessages.length)) {
-                                    const titleToUpdate = await this.summarizeChat(inputMessages);
+                                    const generated = await this.generateTitle(inputMessages);
+                                    if (generated.usage) yield usageIncrement(generated.usage, generated.model, "title");
+                                    const titleToUpdate = generated.title;
                                     await this.messageService.updateTitle(sessionId, userId, titleToUpdate);
                                     yield { type: "session_title", content: titleToUpdate };
                                 }
@@ -441,7 +450,7 @@ export class OpenAIProvider implements ILLM {
                             } as LLMMessage;
                         }
 
-                       
+
                         if (event.type === "response.output_item.added" && event.item?.type === "mcp_call") {
                             mcpCallTools.set(event.item.id ?? "", {
                                 id: event.item.id,
@@ -456,7 +465,7 @@ export class OpenAIProvider implements ILLM {
                             } as unknown as LLMMessage;
                         }
 
-                       
+
                         if (event.type === "response.output_item.added" && event.item?.type === "mcp_list_tools") {
                             yield {
                                 type: "mcp_list_tools",
@@ -533,9 +542,6 @@ export class OpenAIProvider implements ILLM {
                             } as unknown as LLMMessage;
                         }
 
-                        // The container_id isn't guaranteed to be present yet on the
-                        // "added" event above — it's confirmed present here — so back-fill
-                        // it defensively in case it was missing earlier.
                         if (event.type === "response.output_item.done" && event.item?.type === "code_interpreter_call") {
                             const call = codeInterpreterCalls.get(event.item.id);
                             if (call && !call.container_id && event.item.container_id) {
@@ -555,7 +561,6 @@ export class OpenAIProvider implements ILLM {
                             } as unknown as LLMMessage;
                         }
 
-                        // Generated file (chart, csv, etc.) cited on the assistant's output text.
                         if (event.type === "response.output_text.annotation.added" && event.annotation?.type === "container_file_citation") {
                             const fileKey = `${event.annotation.container_id}:${event.annotation.file_id}`;
                             if (!collectedCodeFileKeys.has(fileKey)) {
@@ -566,16 +571,6 @@ export class OpenAIProvider implements ILLM {
                                     filename: event.annotation.filename as string | undefined,
                                 };
                                 collectedCodeFiles.push(fileRef);
-
-                                // Mirror the file to S3 right now, while the container is
-                                // still definitely alive — waiting until the user clicks
-                                // "download" later means the container may already be
-                                // gone. Awaited inline so fileRef.url is already set by
-                                // the time response.output_text.done (below) builds the
-                                // persisted code_interpreter content part; best-effort —
-                                // on any failure this just leaves url unset and the old
-                                // live-container-proxy route (session_routes.ts) is still
-                                // there as a fallback.
                                 const persisted = await this.persistCodeInterpreterFile(
                                     fileRef.container_id,
                                     fileRef.file_id,
@@ -606,11 +601,6 @@ export class OpenAIProvider implements ILLM {
                                 } as LLMMessage;
 
                                 let result: string;
-                                // Hoisted out of the try so it's still in scope when
-                                // constructing `toolCall` below; also fixes a double-JSON-encoding
-                                // bug: fromInput()'s "tool_call" case does JSON.stringify(m.arguments),
-                                // which assumes arguments is an object. Storing the raw string here
-                                // meant every replay re-stringified an already-stringified value.
                                 let parsedArgs: Record<string, any> = {};
                                 try {
                                     const db = await this.messageService.rawDb() as unknown as IDatabaseAdapter;
@@ -620,7 +610,7 @@ export class OpenAIProvider implements ILLM {
                                         throw new Error(`Model produced invalid JSON arguments for "${item.name}": ${item.arguments}`);
                                     }
 
-                                    const toolOutput = await this.tools.executeTool(item.name, parsedArgs, { db });
+                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId });
                                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                                     yield {
                                         type: "function_call_output",
@@ -628,16 +618,6 @@ export class OpenAIProvider implements ILLM {
                                         output: result,
                                     } as LLMMessage;
 
-                                    // RAG source extraction. search_knowledge_base
-                                    // (createVectorSearchTool in the RAG tool file) returns
-                                    // a single result object shaped like:
-                                    //   { source_file, heading, score, content }
-                                    // — NOT wrapped in a `results` array. It may also come
-                                    // back as an array of these objects when there are
-                                    // multiple matches. Normalize both shapes into an array
-                                    // before pulling out source_file, dedupe, and push a live
-                                    // update to the client immediately, in addition to
-                                    // attaching them to the final assistant message later.
                                     try {
                                         if (item.name === this.RAG_TOOL_NAME) {
                                             const parsedOutput = typeof toolOutput === "string" ? JSON.parse(toolOutput) : toolOutput;
@@ -661,7 +641,7 @@ export class OpenAIProvider implements ILLM {
                                             }
                                         }
                                     } catch {
-                                       
+
                                     }
                                 } catch (toolErr) {
                                     const errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
@@ -730,6 +710,7 @@ export class OpenAIProvider implements ILLM {
 
                         if (event.type === "response.completed") {
                             sawResponseCompleted = true;
+                            if (event.response?.usage) yield usageIncrement(openaiUsage(event.response.usage), event.response.model ?? activeModel);
                             if (!functionCallTools.size && !mcpCallTools.size) {
                                 if (calledAnyToolThisTurn) {
                                     break readLoop;
@@ -757,6 +738,8 @@ export class OpenAIProvider implements ILLM {
 
             } catch (err: any) {
                 if (err?.name === "AbortError") {
+                    await this.savePartialReply(sessionId, pendingText, activeModel);
+                    pendingText = "";
                     yield { type: "cancelled", content: [{ type: "aborted", text: "Request cancelled." }] };
                 } else {
                     console.error("[OpenAIProvider] chatStream request threw:", err);
@@ -768,6 +751,22 @@ export class OpenAIProvider implements ILLM {
             }
         }
     }
+    // Keeps what the user already saw on screen when they pressed Stop, so a
+    // reload shows the same partial answer instead of nothing.
+    private async savePartialReply(sessionId: string, text: string, model: string): Promise<void> {
+        if (!text) return;
+        try {
+            await this.messageService.createLLMMessage(sessionId, {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text }],
+                metadata: { provider: "openai", model, cancelled: true },
+            });
+        } catch (err) {
+            console.error("[OpenAIProvider] failed to save partial reply:", err);
+        }
+    }
+
     private findReusableContainer(messages: LLMMessage[]): { containerId: string; ageMs: number } | null {
         for (let i = messages.length - 1; i >= 0; i--) {
             const m = messages[i];
@@ -838,4 +837,20 @@ export class OpenAIProvider implements ILLM {
     getModel(): string {
         return this.config.model;
     }
+
+    getModels(): string[] {
+        return this.config.models ?? [this.config.model];
+    }
+}
+
+// OpenAI counts cached input inside input_tokens; split it out so usage is
+// comparable with Claude's.
+function openaiUsage(u: any): TokenCounts {
+    const cached = u?.input_tokens_details?.cached_tokens ?? 0;
+    return {
+        input_tokens: Math.max(0, (u?.input_tokens ?? 0) - cached),
+        output_tokens: u?.output_tokens ?? 0,
+        cache_read_tokens: cached,
+        cache_write_tokens: 0,
+    };
 }

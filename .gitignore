@@ -30,3 +30,9 @@ Thumbs.db
 # Test/coverage artifacts
 coverage/
 *.tsbuildinfo
+
+# Firebase Admin service-account key — a private credential, never commit it.
+serviceAccountKey.json
+
+# Encryption key for secrets saved on agents (auto-created if AGENT_SECRETS_KEY is unset)
+.agent_secrets_key
