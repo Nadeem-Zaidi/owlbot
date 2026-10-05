@@ -1,0 +1,47 @@
+# Caddy: serves the web app, proxies the API, and gets/renews HTTPS
+# certificates from Let's Encrypt automatically for $DOMAIN.
+# DOMAIN=":80" serves plain HTTP (testing only — phone sign-in needs HTTPS).
+
+{$DOMAIN} {
+	# Uploads go through the API (multer allows 100 MB).
+	request_body {
+		max_size 110MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	# Everything the browser sends to the API: /api/* plus the knowledge-base
+	# routes the API serves at the root (see src/routes/storage_routes.ts).
+	@api path /api/* /list_files* /documents* /document_content* /delete* /upload* /healthz /readyz
+	handle @api {
+		reverse_proxy api:3000 {
+			# Stream chat replies (SSE) to the browser as they arrive.
+			flush_interval -1
+			transport http {
+				read_timeout 10m
+			}
+		}
+	}
+
+	# The React app: real files first, otherwise index.html (client-side routes).
+	handle {
+		root * /srv
+		encode zstd gzip
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
+		@html path / /index.html
+		header @html Cache-Control "no-cache"
+		try_files {path} /index.html
+		file_server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -31,7 +31,7 @@ import { KnowledgeBase } from "../src/service/knowledge_base";
         await db.query("SELECT pg_advisory_xact_lock(727274002)");
         await vectorDb.initialize();
     });
-    const s3 = new S3FileStore("nadeem-bucket-9891", {
+    const s3 = new S3FileStore(process.env.S3_BUCKET || "nadeem-bucket-9891", {
         region: process.env.AWS_REGION!,
         accesskeyid: process.env.AWS_ACCESS_KEY_ID!,
         secretaccesskey: process.env.AWS_SECRET_ACCESS_KEY!,

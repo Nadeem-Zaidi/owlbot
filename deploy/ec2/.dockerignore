@@ -1,0 +1,4 @@
+# The web image only needs the Caddyfile and web.Dockerfile.
+*
+!Caddyfile
+!web.Dockerfile

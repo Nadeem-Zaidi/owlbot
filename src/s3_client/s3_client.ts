@@ -23,12 +23,13 @@ export class S3FileStore implements IFileStore {
   private readonly s3Client: S3Client;
 
   constructor(private readonly bucket: string, private readonly config: S3Config, private readonly signal?: AbortSignal) {
+    // With no access keys configured, the AWS SDK's default chain is used —
+    // on EC2 that's the instance's IAM role, so no keys live on the server.
     this.s3Client = new S3Client({
       region: config.region,
-      credentials: {
-        accessKeyId: config.accesskeyid,
-        secretAccessKey: config.secretaccesskey,
-      },
+      ...(config.accesskeyid && config.secretaccesskey
+        ? { credentials: { accessKeyId: config.accesskeyid, secretAccessKey: config.secretaccesskey } }
+        : {}),
     });
   }
   async uploadAndGetUrls(

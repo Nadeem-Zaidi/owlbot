@@ -1,0 +1,123 @@
+# Owl Bot on ONE small server (AWS EC2 t3.small: 2 vCPU, 2 GB RAM).
+#
+#   Internet ──► web (Caddy :80/:443, automatic HTTPS)
+#                  ├── /            → the React app (static files built into this image)
+#                  └── /api, files  → api:3000 (Node)
+#   api ──► postgres (pgvector)      api ──► converter:50051 (Python gRPC)
+#
+# Folder layout on the server (see README.md):
+#   ~/apps/owlbot            this repo (run compose from deploy/ec2)
+#   ~/apps/owlbot_frontend   the web app
+#   ~/apps/owlbot_python     the Python gRPC service
+#
+# Start / update:   ./deploy.sh
+# Logs:             docker compose logs -f api
+#
+# Memory is tight on 2 GB, so every service has a limit and the API runs as a
+# single process (no cluster, no Redis needed). setup.sh adds 2 GB of swap.
+
+name: owlbot
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: web.Dockerfile
+      additional_contexts:
+        frontend: ${FRONTEND_DIR:-../../../owlbot_frontend}
+      args:
+        # Same-origin API: the browser calls https://<domain>/api/…
+        VITE_API_URL: /api
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env (your domain, or :80 for plain HTTP)}
+    volumes:
+      - caddy_data:/data          # HTTPS certificates — keep this volume
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    mem_limit: 128m
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      GRPC_SERVER_ADDRESS: converter:50051
+      PG_POOL_MAX: "10"
+      WHATSAPP_AUTH_DIR: /app/auth_state
+      # Behind Caddy on the Docker network.
+      TRUST_PROXY: "loopback, linklocal, uniquelocal"
+      NODE_OPTIONS: --max-old-space-size=640
+    # One process: runs the API, the agent scheduler and WhatsApp.
+    command: ["node", "dist/main.js"]
+    expose:
+      - "3000"
+    volumes:
+      - whatsapp_auth:/app/auth_state
+    depends_on:
+      postgres:
+        condition: service_healthy
+      converter:
+        condition: service_started
+    mem_limit: 800m
+    stop_grace_period: 30s
+
+  converter:
+    build:
+      context: ${PYTHON_DIR:-../../../owlbot_python}
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "50051"
+    mem_limit: 512m
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USERNAME}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DATABASE}
+    # Tuned for ~350 MB: a small shared buffer, few connections.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - effective_cache_size=384MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - max_connections=40
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USERNAME} -d ${POSTGRES_DATABASE}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    mem_limit: 400m
+    shm_size: 128m
+
+volumes:
+  pgdata:
+  whatsapp_auth:
+  caddy_data:
+  caddy_config:

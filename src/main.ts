@@ -79,7 +79,7 @@ async function wa() {
     const primaryWorker = !process.env.WORKER_INDEX || process.env.WORKER_INDEX === "0";
 
     const s3Config: S3Config = { region: process.env.AWS_REGION!, accesskeyid: process.env.AWS_ACCESS_KEY_ID!, secretaccesskey: process.env.AWS_SECRET_ACCESS_KEY! };
-    const s3Client = new S3FileStore("nadeem-bucket-9891", s3Config);
+    const s3Client = new S3FileStore(process.env.S3_BUCKET || "nadeem-bucket-9891", s3Config);
     const embedder = new Embedder(OPENAI_API_KEY, EMBEDDING_MODEL, s3Client, vectorDb);
     const chatMessageService = new MessageService(new SessionRepository(db), new MessageRepository(db));
 
