@@ -235,7 +235,8 @@ export class BillingService {
         if (q.allowed) return null;
         const name = planById(q.plan)?.name ?? q.plan;
         return `You've used your ${q.quota.toLocaleString("en-IN")} tokens for this month on the ${name} plan. ` +
-            `Upgrade on the Plan & billing page, or wait until ${q.resetsAt.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}.`;
+            `Upgrade on the Plan & billing page, pick a model on your own API key (doesn't count toward the plan), ` +
+            `or wait until ${q.resetsAt.toLocaleDateString("en-IN", { day: "numeric", month: "short" })}.`;
     }
 
     private async isExempt(userId: string): Promise<boolean> {

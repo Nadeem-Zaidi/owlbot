@@ -6,6 +6,17 @@ import { LLMMessage, Tool } from "../types/llm_message";
 //   { type: "usage_increment", usage: TokenCounts, model, kind?: "title" }
 export type UsageIncrement = { type: "usage_increment"; usage: TokenCounts; model?: string; kind?: "chat" | "title" };
 
+// Providers report usage only when a reply completes. When the user presses
+// Stop, the provider has still billed the input and the output generated so
+// far, so record an estimate (~4 characters per token) instead of nothing —
+// otherwise cancelled replies are free on the Usage page and the quota.
+export function estimatedUsageIncrement(inputChars: number, outputChars: number, model?: string): LLMMessage {
+    return usageIncrement({
+        input_tokens: Math.ceil(Math.max(0, inputChars) / 4),
+        output_tokens: Math.ceil(Math.max(0, outputChars) / 4),
+    }, model);
+}
+
 export function usageIncrement(usage: Partial<TokenCounts>, model?: string, kind: "chat" | "title" = "chat"): LLMMessage {
     return { type: "usage_increment", usage: { ...emptyCounts(), ...usage }, model, kind } as unknown as LLMMessage;
 }
@@ -32,7 +43,9 @@ export class UsageTrackingLLM implements ILLM {
     // call chatStream through this wrapper.
     static quotaGate: ((userId: string) => Promise<string | null>) | null = null;
 
-    constructor(private inner: ILLM, private usage: UsageRepository) {}
+    // `byok`: this provider runs on the user's own API key — no quota check,
+    // and its usage is recorded as BYOK (excluded from the plan's quota).
+    constructor(private inner: ILLM, private usage: UsageRepository, private byok: { keyId: string } | null = null) {}
 
     chat(messages: LLMMessage[], tools: Tool[]) { return this.inner.chat(messages, tools); }
     summarizeChat(message: any, userId: string, sessionId: string) { return this.inner.summarizeChat(message, userId, sessionId); }
@@ -46,21 +59,22 @@ export class UsageTrackingLLM implements ILLM {
         let requests = 0;
         let servedBy = model ?? this.inner.getModel();
         let emitted = false;
-        const blocked = UsageTrackingLLM.quotaGate ? await UsageTrackingLLM.quotaGate(userId).catch(() => null) : null;
+        const blocked = !this.byok && UsageTrackingLLM.quotaGate ? await UsageTrackingLLM.quotaGate(userId).catch(() => null) : null;
         if (blocked) {
             yield { type: "error", code: "quota_exceeded", message: blocked } as unknown as LLMMessage;
             return;
         }
         const startId = await this.usage.lastMessageId(sessionId).catch(() => 0);
 
-        const summary = () => ({ ...turn, total_tokens: totalTokens(turn), requests, model: servedBy, provider: this.inner.getProvider() });
+        const summary = () => ({ ...turn, total_tokens: totalTokens(turn), requests, model: servedBy, provider: this.inner.getProvider(), byok: !!this.byok });
+        const own = { byok: !!this.byok, keyId: this.byok?.keyId ?? null };
 
         try {
             for await (const chunk of this.inner.chatStream(messages, userId, sessionId, apiKey, signal, model, run)) {
                 if ((chunk as any).type === "usage_increment") {
                     const inc = chunk as unknown as UsageIncrement;
                     if (inc.kind === "title") {
-                        void this.usage.record({ userId, sessionId, kind: "title", provider: this.inner.getProvider(), model: inc.model, ...inc.usage })
+                        void this.usage.record({ userId, sessionId, kind: "title", provider: this.inner.getProvider(), model: inc.model, ...own, ...inc.usage })
                             .catch((e) => console.error("[usage] couldn't record title usage:", e));
                     } else {
                         add(turn, inc.usage);
@@ -81,7 +95,7 @@ export class UsageTrackingLLM implements ILLM {
         } finally {
             if (requests > 0) {
                 try {
-                    await this.usage.record({ userId, sessionId, kind: "chat", provider: this.inner.getProvider(), model: servedBy, requests, ...turn });
+                    await this.usage.record({ userId, sessionId, kind: "chat", provider: this.inner.getProvider(), model: servedBy, requests, ...own, ...turn });
                     await this.usage.attachToLastReply(sessionId, startId, summary());
                 } catch (e) {
                     console.error("[usage] couldn't record usage:", e);

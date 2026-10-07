@@ -12,8 +12,10 @@ import { NativeAgentService } from "../service/native_agents/native_agent_servic
 import { KnowledgeBase } from "../service/knowledge_base";
 import { withAttachmentText } from "../service/attachment_text";
 import { BillingService } from "../service/billing/billing_service";
+import { ModelRegistry } from "../service/model_registry";
 dotenv.config();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
+const MAX_PINNED = 50;
 
 const PROVIDER_LABELS: Partial<Record<LLMProvider, string>> = {
     openai: "ChatGPT",
@@ -40,6 +42,8 @@ export class ChatMessages extends BaseRouter<MessageService> {
     nativeAgents?: NativeAgentService;
     kb?: KnowledgeBase;
     billing?: BillingService;
+    // Server providers + the user's own keys (BYOK). Set from main.ts.
+    registry?: ModelRegistry;
 
     constructor(messsageService: MessageService, providers: Map<LLMProvider, ILLM>, defaultProvider: LLMProvider, agents?: AgentService, nativeAgents?: NativeAgentService, kb?: KnowledgeBase) {
         super("/session", messsageService)
@@ -59,6 +63,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
         // Lists the providers that have an API key configured, so the UI's
         // model picker only offers ones that will actually work.
         this.router.get("/providers", this.asyncHandler(async (req, res) => {
+            if (this.registry) return res.status(200).json(await this.registry.listFor(req.user!.sub));
             const providers = [...this.providers.entries()].map(([id, llm]) => ({
                 id,
                 label: PROVIDER_LABELS[id] ?? id,
@@ -107,6 +112,18 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
 
 
+        // Pin (favourite) or unpin a chat: { pinned: true | false }.
+        this.router.put("/sessions/:sessionId/pin", this.asyncHandler(async (req, res) => {
+            const sessionId = String(req.params.sessionId ?? "");
+            if (typeof req.body?.pinned !== "boolean") return res.status(400).json({ message: "pinned must be true or false" });
+            if (req.body.pinned && (await this.service.countPinned(req.user!.sub)) >= MAX_PINNED) {
+                return res.status(400).json({ message: `You can pin up to ${MAX_PINNED} chats — unpin one first.` });
+            }
+            const result = await this.service.setPinned(sessionId, req.user!.sub, req.body.pinned).catch(() => null);
+            if (!result) return res.status(404).json({ message: "Chat not found" });
+            return res.status(200).json(result);
+        }));
+
         this.router.delete("/delete/:sessionId", this.asyncHandler(async (req, res) => {
             const { sessionId } = req.params;
 
@@ -132,7 +149,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
 
         this.router.post("/chat_stream", this.asyncHandler(async (req, res) => {
-            const { llmMessage: rawMessage, currentSessionId, provider, model: requestedModel, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: LLMProvider, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
+            const { llmMessage: rawMessage, currentSessionId, provider, model: requestedModel, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: string, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
             let model = requestedModel;
             if (!currentSessionId) {
                 throw new InvalidSession()
@@ -144,14 +161,22 @@ export class ChatMessages extends BaseRouter<MessageService> {
             void this.billing?.rememberUser(req.user!.sub, req.user!.email);
             // Attached Word/Excel/PowerPoint/text files: include their extracted text.
             const llmMessage = this.kb && rawMessage ? await withAttachmentText(rawMessage, req.user!.sub, this.kb) : rawMessage;
-            let llm = this.providers.get(provider ?? this.defaultProvider);
-            if (!llm) {
-                throw new ValidationError(`LLM provider "${provider}" is not available`);
-            }
-            // Only allow models configured for this provider — the client can't
-            // pick an arbitrary (possibly expensive) model.
-            if (model && !(llm.getModels?.() ?? [llm.getModel()]).includes(model)) {
-                throw new ValidationError(`Model "${model}" is not available for ${llm.getProvider()}`);
+            // Only models configured for the server, or on the user's own key —
+            // the client can't pick an arbitrary (possibly expensive) model.
+            let llm: ILLM;
+            if (this.registry) {
+                const resolved = await this.registry.resolve(req.user!.sub, provider, model, true).catch((err) => {
+                    throw new ValidationError(err instanceof Error ? err.message : String(err));
+                });
+                llm = resolved.llm;
+                model = resolved.model;
+            } else {
+                const found = this.providers.get((provider ?? this.defaultProvider) as LLMProvider);
+                if (!found) throw new ValidationError(`LLM provider "${provider}" is not available`);
+                if (model && !(found.getModels?.() ?? [found.getModel()]).includes(model)) {
+                    throw new ValidationError(`Model "${model}" is not available for ${found.getProvider()}`);
+                }
+                llm = found;
             }
 
             // A chat that belongs to an agent (or the first message of a new
@@ -173,7 +198,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
             } else if (this.agents) {
                 const agent = await this.agents.agentForSession(String(currentSessionId), req.user!.sub, agentId);
                 if (agent) {
-                    const resolved = this.agents.resolveLLM(agent);
+                    const resolved = await this.agents.resolveLLM(agent);
                     llm = resolved.llm;
                     model = resolved.model;
                     run = await this.agents.buildRun(agent);

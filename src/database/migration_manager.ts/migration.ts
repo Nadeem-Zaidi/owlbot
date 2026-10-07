@@ -573,6 +573,98 @@ export const migration_20261005150000: Migration = {
 };
 
 
+export const migration_20261007100000: Migration = {
+  version: "20261007100000",
+  description: "BYOK: users' own model API keys; usage flagged as BYOK; app settings (WhatsApp)",
+  up: [
+    // A user's own provider key. The key itself is AES-256-GCM encrypted
+    // (service/agents/secrets.ts); only its last characters are ever shown.
+    `CREATE TABLE IF NOT EXISTS user_llm_keys (
+       id UUID PRIMARY KEY,
+       user_id TEXT NOT NULL,
+       kind TEXT NOT NULL CHECK (kind IN ('openai', 'anthropic', 'openai_compatible')),
+       label TEXT NOT NULL,
+       base_url TEXT,
+       api_key_enc TEXT NOT NULL,
+       key_hint TEXT NOT NULL,
+       models JSONB NOT NULL DEFAULT '[]'::jsonb,
+       default_model TEXT,
+       enabled BOOLEAN NOT NULL DEFAULT true,
+       last_verified_at TIMESTAMPTZ,
+       last_error TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       UNIQUE (user_id, label)
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_user_llm_keys_user ON user_llm_keys(user_id)`,
+    // Usage on a user's own key is recorded (and shown) but never counts
+    // toward the plan's monthly token quota.
+    `ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS byok BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE token_usage ADD COLUMN IF NOT EXISTS key_id UUID`,
+    // Server-wide settings editable in the web app (owner only).
+    `CREATE TABLE IF NOT EXISTS app_settings (
+       key TEXT PRIMARY KEY,
+       value JSONB NOT NULL,
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       updated_by TEXT
+     )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS app_settings`,
+    `ALTER TABLE token_usage DROP COLUMN IF EXISTS key_id`,
+    `ALTER TABLE token_usage DROP COLUMN IF EXISTS byok`,
+    `DROP TABLE IF EXISTS user_llm_keys`,
+  ]
+};
+
+
+export const migration_20261008100000: Migration = {
+  version: "20261008100000",
+  description: "Artifacts: documents/reports the assistant creates in chat, with versions",
+  up: [
+    `CREATE TABLE IF NOT EXISTS artifacts (
+       id UUID PRIMARY KEY,
+       user_id TEXT NOT NULL,
+       session_id UUID,
+       title TEXT NOT NULL,
+       kind TEXT NOT NULL CHECK (kind IN ('html', 'markdown')),
+       current_version INTEGER NOT NULL DEFAULT 1,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_artifacts_user ON artifacts(user_id, updated_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id) WHERE session_id IS NOT NULL`,
+    `CREATE TABLE IF NOT EXISTS artifact_versions (
+       artifact_id UUID NOT NULL REFERENCES artifacts(id) ON DELETE CASCADE,
+       version INTEGER NOT NULL,
+       title TEXT NOT NULL,
+       content TEXT NOT NULL,
+       change_summary TEXT,
+       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+       PRIMARY KEY (artifact_id, version)
+     )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS artifact_versions`,
+    `DROP TABLE IF EXISTS artifacts`,
+  ]
+};
+
+
+export const migration_20261009100000: Migration = {
+  version: "20261009100000",
+  description: "Pinned (favourite) chats",
+  up: [
+    `ALTER TABLE sessions ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ`,
+    `CREATE INDEX IF NOT EXISTS idx_sessions_pinned ON sessions(userid, pinned_at DESC) WHERE pinned_at IS NOT NULL`,
+  ],
+  down: [
+    `DROP INDEX IF EXISTS idx_sessions_pinned`,
+    `ALTER TABLE sessions DROP COLUMN IF EXISTS pinned_at`,
+  ]
+};
+
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -588,5 +680,8 @@ export const migrations: Migration[] = [
   migration_20261005120000,
   migration_20261005130000,
   migration_20261005140000,
-  migration_20261005150000
+  migration_20261005150000,
+  migration_20261007100000,
+  migration_20261008100000,
+  migration_20261009100000
 ];

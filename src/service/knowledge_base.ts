@@ -37,6 +37,28 @@ export type KnowledgeDocument = { key: string; name: string; chunks: number; upd
 
 export type DocumentText = { key: string; name: string; content: string; truncated: boolean; totalChars: number };
 
+// Search-index (RAG) state of one stored file, shown in the file list.
+//   indexed     — its chunks are in the vector DB
+//   not_indexed — nothing indexed yet (e.g. files that were in the bucket
+//                 before this server was set up); can be indexed on demand
+//   copy        — the Markdown text copy made from another file at upload;
+//                 it is searchable through that file, never indexed itself
+//   unsupported — no text to extract (images, audio, video, archives)
+export type RagStatus =
+    | { status: "indexed"; chunks: number }
+    | { status: "not_indexed" }
+    | { status: "copy"; of: string }
+    | { status: "unsupported" };
+
+export type IndexOutcome =
+    | { key: string; status: "indexed"; chunks: number }
+    | { key: string; status: "failed"; error: string };
+
+const stemOf = (key: string) => key.replace(/\.[^./]+$/, "");
+const isMarkdown = (key: string) => /\.md$/i.test(key);
+const NO_TEXT_EXTENSIONS = new Set(["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "heic", "mp3", "wav", "m4a", "ogg", "mp4", "mov", "avi", "webm", "zip", "rar", "7z", "gz", "tar", "exe", "dll", "bin"]);
+const hasNoText = (key: string) => NO_TEXT_EXTENSIONS.has(key.split(".").pop()?.toLowerCase() ?? "");
+
 // The user's knowledge base — listing, reading and adding documents. Shared
 // by the web routes (storage_routes.ts) and the WhatsApp bridge so both
 // index and read documents exactly the same way.
@@ -211,6 +233,77 @@ export class KnowledgeBase {
         const ids = await this.embedder.embedAndStore(chunks);
         await this.vectorDb.deleteStaleChunks?.(key, ids);
         return { key, before: existing.length, after: chunks.length, from };
+    }
+
+    // RAG state for a set of stored files (one page of the file list). One
+    // vector-DB query for the whole user folder, then pure matching.
+    async ragStatuses(userId: string, keys: string[]): Promise<Map<string, RagStatus>> {
+        const out = new Map<string, RagStatus>();
+        const indexed = new Map<string, number>();
+        if (this.vectorDb?.listSourceFiles) {
+            for (const r of await this.vectorDb.listSourceFiles(`${userId}/`)) indexed.set(r.source_file, r.chunks);
+        }
+        // Originals that a Markdown copy can belong to: listed or indexed,
+        // non-.md files. A copy is named "<stem>.md" or "<file>.md".
+        const originals = new Map<string, string>();
+        for (const k of [...keys, ...indexed.keys()]) {
+            if (isMarkdown(k)) continue;
+            originals.set(`${stemOf(k)}.md`, k);
+            originals.set(`${k}.md`, k);
+        }
+        for (const key of keys) {
+            const chunks = indexed.get(key);
+            if (chunks) out.set(key, { status: "indexed", chunks });
+            else if (isMarkdown(key) && originals.has(key)) out.set(key, { status: "copy", of: originals.get(key)! });
+            else if (hasNoText(key)) out.set(key, { status: "unsupported" });
+            else out.set(key, { status: "not_indexed" });
+        }
+        return out;
+    }
+
+    // Indexes a file that is already in storage (uploads index automatically;
+    // this covers files that were there before, or whose indexing failed).
+    // Uses the stored Markdown copy when there is one, otherwise converts the
+    // file and keeps the copy next to it, like an upload does.
+    async indexStoredFile(userId: string, rawKey: string): Promise<IndexOutcome> {
+        const key = rawKey.trim();
+        const name = key.split("/").pop() || key;
+        if (!key.startsWith(`${userId}/`) || key.includes("..")) {
+            return { key, status: "failed", error: "Not one of your files" };
+        }
+        if (hasNoText(key)) return { key, status: "failed", error: `"${name}" has no text that can be indexed` };
+        try {
+            let markdown = await this.readMarkdownCopy(key);
+            if (!markdown) {
+                const parts: Buffer[] = [];
+                try {
+                    for await (const part of await this.storage.readStream(key)) parts.push(Buffer.from(part));
+                } catch {
+                    return { key, status: "failed", error: `"${name}" isn't in storage anymore` };
+                }
+                const converted = await convertFileToMarkdown(name, Buffer.concat(parts)).catch((e) => {
+                    console.error(`[index] markdown conversion failed for "${key}":`, e);
+                    return null;
+                });
+                markdown = converted?.markdown?.trim() || null;
+                if (markdown && converted?.filename && !isMarkdown(key)) {
+                    const folder = key.slice(0, key.lastIndexOf("/") + 1);
+                    await this.storage
+                        .uploadAndGetUrls([{ buffer: Buffer.from(markdown, "utf-8"), originalname: converted.filename, mimetype: "text/markdown" }], folder)
+                        .catch((e) => console.error(`[index] could not store the text copy of "${key}":`, e));
+                }
+            }
+            if (!markdown) return { key, status: "failed", error: `No text could be read from "${name}"` };
+
+            const chunks = chunkMarkdown(markdown, key);
+            if (chunks.length === 0) return { key, status: "failed", error: `"${name}" has no text to index` };
+            const ids = await this.embedder.embedAndStore(chunks);
+            await this.dropStaleChunks(key, ids);
+            return { key, status: "indexed", chunks: chunks.length };
+        } catch (error) {
+            console.error(`[index] indexing failed for "${key}":`, error);
+            return { key, status: "failed", error: `Indexing failed: ${error instanceof Error ? error.message : String(error)}` };
+        }
     }
 
     private async readMarkdownCopy(key: string): Promise<string | null> {

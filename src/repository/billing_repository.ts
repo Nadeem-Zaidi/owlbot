@@ -122,11 +122,12 @@ export class BillingRepository {
         await this.db.query(`DELETE FROM billing_events WHERE event_id = $1`, [eventId]);
     }
 
-    // Tokens used since `since` (all features), for the quota.
+    // Tokens used since `since` (all features), for the quota. Usage on the
+    // user's own API keys (BYOK) is excluded — they pay their provider directly.
     async tokensSince(userId: string, since: Date): Promise<number> {
         const { rows } = await this.db.query<{ n: string | null }>(
             `SELECT SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens)::bigint AS n
-             FROM token_usage WHERE user_id = $1 AND created_at >= $2`,
+             FROM token_usage WHERE user_id = $1 AND created_at >= $2 AND NOT byok`,
             [userId, since]
         );
         return Number(rows[0]?.n ?? 0);

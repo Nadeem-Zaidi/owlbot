@@ -7,6 +7,7 @@ import { chunkMessage, toWhatsApp } from "../channels/whatsapp_format";
 import { KnowledgeBase } from "./knowledge_base";
 import { MessageService } from "./message_service";
 import { buildExplainDocumentParts } from "./explain_document";
+import { ModelRegistry } from "./model_registry";
 
 type BridgeDeps = {
     channel: IChannel;
@@ -15,6 +16,8 @@ type BridgeDeps = {
     providers: Map<LLMProvider, ILLM>;
     defaultProvider: LLMProvider;
     kb: KnowledgeBase;
+    // Server providers + the user's own keys (BYOK).
+    registry?: ModelRegistry;
 };
 
 const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
@@ -63,10 +66,15 @@ export class WhatsAppBridge {
         const away = await this.deps.repo.getAway();
         if (!away.enabled || !away.message.trim()) return null;
         if (away.until && new Date(away.until).getTime() <= Date.now()) {
+            console.log("[whatsapp] away message ended (its end time passed) — turned off");
             await this.deps.repo.disableAway();
             return null;
         }
-        if (!(await this.deps.repo.claimAwayReply(req.jid, req.name ?? null, away.cooldown_minutes))) return null;
+        if (!(await this.deps.repo.claimAwayReply(req.jid, req.name ?? null, away.cooldown_minutes))) {
+            const hours = Math.round(away.cooldown_minutes / 6) / 10;
+            console.log(`[whatsapp] away message skipped for ${maskJid(req.jid)}: already sent in the last ${hours} h (repeat interval)`);
+            return null;
+        }
         return { text: renderAway(away.message, req.name), failed: () => this.deps.repo.releaseAwayReply(req.jid) };
     }
 
@@ -245,11 +253,14 @@ export class WhatsAppBridge {
     }
 
     private async switchModel(link: WhatsAppLink, arg: string): Promise<void> {
-        const options = [...this.deps.providers.entries()].flatMap(([provider, llm]) =>
-            (llm.getModels?.() ?? [llm.getModel()]).map((model) => ({ provider, model }))
-        );
-        const current = this.pickLLM(link);
-        const label = (o: { provider: string; model: string }) => `${PROVIDER_LABELS[o.provider] ?? o.provider} · ${o.model}`;
+        // The server's models plus the user's own keys.
+        const options = this.deps.registry
+            ? (await this.deps.registry.listFor(link.user_id)).providers.flatMap((p) =>
+                p.models.map((m) => ({ provider: p.id, model: m.id, providerLabel: p.label })))
+            : [...this.deps.providers.entries()].flatMap(([provider, llm]) =>
+                (llm.getModels?.() ?? [llm.getModel()]).map((model) => ({ provider: provider as string, model, providerLabel: PROVIDER_LABELS[provider] ?? provider })));
+        const current = await this.pickLLM(link);
+        const label = (o: { providerLabel: string; model: string }) => `${o.providerLabel} · ${o.model}`;
 
         if (!arg) {
             const lines = options.map((o, i) => `${i + 1}. ${label(o)}${o.provider === current.provider && o.model === current.model ? "  ✓" : ""}`);
@@ -264,7 +275,11 @@ export class WhatsAppBridge {
         return this.reply(link.jid, `Switched to *${label(choice)}*.`);
     }
 
-    private pickLLM(link: WhatsAppLink): { provider: LLMProvider; model: string; llm: ILLM } {
+    private async pickLLM(link: WhatsAppLink): Promise<{ provider: string; model: string; llm: ILLM }> {
+        if (this.deps.registry) {
+            const r = await this.deps.registry.resolve(link.user_id, link.provider, link.model);
+            return { provider: r.provider, model: r.model, llm: r.llm };
+        }
         const preferred = link.provider as LLMProvider | null;
         const provider = preferred && this.deps.providers.has(preferred) ? preferred : this.deps.defaultProvider;
         const llm = this.deps.providers.get(provider)!;
@@ -300,7 +315,7 @@ export class WhatsAppBridge {
     private async ask(link: WhatsAppLink, parts: ContentPart[]): Promise<void> {
         const jid = link.jid;
         const sessionId = await this.ensureSession(link);
-        const { llm, model } = this.pickLLM(link);
+        const { llm, model } = await this.pickLLM(link);
         const message: LLMMessage = { type: "message", role: "user", content: parts };
 
         const controller = new AbortController();
@@ -369,4 +384,10 @@ export class WhatsAppBridge {
 export function renderAway(template: string, name?: string): string {
     const first = (name ?? "").trim().split(/\s+/)[0] || "there";
     return template.replace(/\{name\}/gi, first).trim();
+}
+
+// "919876543210@s.whatsapp.net" → "+9198…10" for logs (never a full number).
+function maskJid(jid: string): string {
+    const n = jid.split("@")[0];
+    return jid.endsWith("@lid") ? `privacy id …${n.slice(-4)}` : `+${n.slice(0, 4)}…${n.slice(-2)}`;
 }

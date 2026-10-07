@@ -46,8 +46,9 @@ services:
     environment:
       <<: *app-env
       CLUSTER_WORKERS: ${API_WORKERS:-2}
-      # Single-instance jobs run in the "jobs" service instead.
-      WHATSAPP_ENABLED: "false"
+      # Single-instance jobs run in the "jobs" service instead. (WhatsApp on/off
+      # itself is a Server setting in the web app; this only says where it may run.)
+      WHATSAPP_HOST: "false"
       SCHEDULER_ENABLED: "false"
     deploy:
       replicas: ${API_REPLICAS:-3}
@@ -59,6 +60,8 @@ services:
     environment:
       <<: *app-env
       CLUSTER_WORKERS: "1"
+      WHATSAPP_HOST: "true"
+      # First boot only: seeds the Server setting (change it in the web app later).
       WHATSAPP_ENABLED: ${WHATSAPP_ENABLED:-false}
       SCHEDULER_ENABLED: "true"
     volumes:

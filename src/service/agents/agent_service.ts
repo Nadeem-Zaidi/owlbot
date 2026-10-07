@@ -1,3 +1,5 @@
+import { ModelRegistry } from "../model_registry";
+import { ToolDefinition } from "../../types/type";
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { ChatRunOptions, ILLM } from "../../interfaces/illm";
@@ -35,6 +37,10 @@ type Deps = {
     vectorDb: IVectorDb;
     embed: EmbeddingProvider;
     usage?: UsageRepository;
+    // Server providers + users' own keys (BYOK). Optional so tests can omit it.
+    registry?: ModelRegistry;
+    // Tools every agent gets (documents in the side panel).
+    alwaysTools?: ToolDefinition[];
 };
 
 const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
@@ -61,16 +67,23 @@ export class AgentService {
     constructor(private deps: Deps) {}
 
     // ── catalog ──
-    catalog(email?: string) {
+    // Models an agent can use: the server's, plus the user's own keys.
+    async catalog(email?: string, userId?: string) {
+        const providers = this.deps.registry && userId
+            ? (await this.deps.registry.listFor(userId)).providers.map((p) => ({
+                id: p.id, label: p.label, byok: p.byok, defaultModel: p.defaultModel, models: p.models.map((m) => m.id),
+            }))
+            : [...this.deps.providers.entries()].map(([id, llm]) => ({
+                id,
+                label: PROVIDER_LABELS[id] ?? id,
+                byok: false,
+                defaultModel: llm.getModel(),
+                models: llm.getModels?.() ?? [llm.getModel()],
+            }));
         return {
             builtinTools: BUILTIN_TOOLS,
             codeFunctions: { enabled: codeFunctionsEnabled(), canWrite: isOwner(email), email: email ?? null },
-            providers: [...this.deps.providers.entries()].map(([id, llm]) => ({
-                id,
-                label: PROVIDER_LABELS[id] ?? id,
-                defaultModel: llm.getModel(),
-                models: llm.getModels?.() ?? [llm.getModel()],
-            })),
+            providers,
             defaultProvider: this.deps.defaultProvider,
         };
     }
@@ -130,7 +143,12 @@ export class AgentService {
 
         let provider: string | null = typeof b?.provider === "string" && b.provider ? b.provider : null;
         let model: string | null = typeof b?.model === "string" && b.model ? b.model : null;
-        if (provider) {
+        if (provider && this.deps.registry) {
+            // Accepts the server's providers and the user's own keys ("key:<id>").
+            await this.deps.registry.validateChoice(userId, provider, model).catch((err) => {
+                throw new AgentError(err instanceof Error ? err.message : String(err));
+            });
+        } else if (provider) {
             const llm = this.deps.providers.get(provider as LLMProvider);
             if (!llm) throw new AgentError(`Provider "${provider}" isn't configured on this server`);
             const models = llm.getModels?.() ?? [llm.getModel()];
@@ -550,7 +568,13 @@ export class AgentService {
 
     // ── running ──
     // The provider/model an agent uses (falls back to the server default).
-    resolveLLM(agent: AgentRow): { llm: ILLM; model: string } {
+    // A provider/key that disappeared (e.g. the user deleted their key) falls
+    // back to the server default instead of breaking the agent.
+    async resolveLLM(agent: AgentRow): Promise<{ llm: ILLM; model: string }> {
+        if (this.deps.registry) {
+            const r = await this.deps.registry.resolve(agent.user_id, agent.provider, agent.model);
+            return { llm: r.llm, model: r.model };
+        }
         const provider = agent.provider && this.deps.providers.has(agent.provider as LLMProvider)
             ? (agent.provider as LLMProvider)
             : this.deps.defaultProvider;
@@ -565,7 +589,7 @@ export class AgentService {
             this.deps.repo.listMcpServers(agent.id),
             codeFunctionsEnabled() ? this.deps.repo.listCodeFunctions(agent.id) : Promise.resolve([]),
         ]);
-        const tools = buildAgentToolSet(agent, functions, servers, { vectorDb: this.deps.vectorDb, embed: this.deps.embed, kb: this.deps.kb }, this.mcpPool, codeFunctions);
+        const tools = buildAgentToolSet(agent, functions, servers, { vectorDb: this.deps.vectorDb, embed: this.deps.embed, kb: this.deps.kb, alwaysTools: this.deps.alwaysTools }, this.mcpPool, codeFunctions);
         const docNames = agent.document_keys.map((k) => k.split("/").pop());
 
         // Attached .md files, each under its own heading, after the main instructions.
@@ -597,7 +621,7 @@ export class AgentService {
 
     // One non-interactive turn (used by schedules). Returns the reply text.
     async runOnce(agent: AgentRow, userId: string, sessionId: string, prompt: string, signal: AbortSignal): Promise<{ text: string; error: string | null }> {
-        const { llm, model } = this.resolveLLM(agent);
+        const { llm, model } = await this.resolveLLM(agent);
         const run = await this.buildRun(agent);
         const message: LLMMessage = { type: "message", role: "user", content: [{ type: "text", text: prompt }] };
         let text = "";

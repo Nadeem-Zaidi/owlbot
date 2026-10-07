@@ -8,7 +8,7 @@ import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
 import { ToolDefinition } from "../types/type";
 import { windowHistory } from "./history_window";
-import { usageIncrement } from "./usage_tracking";
+import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
@@ -321,8 +321,10 @@ export class AnthropicProvider implements ILLM {
                     continue;
                 }
                 if (!errorChunk) console.error("[AnthropicProvider] chatStream request threw:", err);
-                if (signal.aborted && streamedText) {
-                    await this.savePartialReply(sessionId, streamedText, activeModel);
+                if (signal.aborted) {
+                    // Stopped mid-reply: the input and the text so far were still billed.
+                    yield estimatedUsageIncrement(JSON.stringify(history).length + system.length + JSON.stringify(tools).length, streamedText.length, activeModel);
+                    if (streamedText) await this.savePartialReply(sessionId, streamedText, activeModel);
                 }
                 yield errorChunk ?? { type: "error", code: "error", message: "Unexpected error.", content: [{ type: "error", text: "Unexpected error." }] };
                 return;
@@ -413,7 +415,7 @@ export class AnthropicProvider implements ILLM {
                     const invalid = this.validateToolInput(toolset, toolUse.name, args);
                     if (invalid) throw new Error(`Invalid arguments for "${toolUse.name}": ${invalid}`);
 
-                    const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId });
+                    const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId, sessionId });
                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                     yield { type: "function_call_output", tool_call_id: toolUse.id, output: result } as LLMMessage;
 

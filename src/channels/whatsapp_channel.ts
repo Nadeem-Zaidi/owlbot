@@ -16,6 +16,9 @@ const MAX_DOCUMENT_BYTES = 25 * 1024 * 1024;
 const SENT_ID_MEMORY = 500;
 // Ignore anything older (e.g. history synced in after reconnecting).
 const MAX_MESSAGE_AGE_MS = 2 * 60 * 1000;
+// The away message still answers messages that arrived while the server was
+// briefly disconnected (deploy, network blip) — they're delivered late.
+const AWAY_MAX_AGE_MS = Number(process.env.WHATSAPP_AWAY_MAX_AGE_MINUTES ?? 30) * 60 * 1000;
 // After you write in someone's chat yourself, the away message stays quiet
 // there for this long — you're clearly around.
 const OWNER_ACTIVE_MS = 30 * 60 * 1000;
@@ -33,14 +36,26 @@ export class WhatsAppChannel implements IChannel {
     // as new input (that's what used to make the bot answer itself).
     private sentIds = new Set<string>();
     // Lets the bot run on your own number: messages you send to yourself
-    // ("Message yourself" chat) become input. Off by default.
-    private readonly selfChat = process.env.WHATSAPP_SELF_CHAT === "true";
+    // ("Message yourself" chat) become input. Set from the server settings and
+    // switchable at runtime (setSelfChat).
+    private selfChat: boolean;
+    // stop() was called: don't auto-reconnect when the socket closes.
+    private stopped = false;
     private warnedSelfChat = false;
     private awayHandler?: AwayHandler;
     // userPart(jid) → when you last wrote in that chat yourself
     private ownerActive = new Map<string, number>();
 
-    constructor(private readonly authDir: string = process.env.WHATSAPP_AUTH_DIR ?? "./auth_state") {}
+    constructor(private readonly authDir: string = process.env.WHATSAPP_AUTH_DIR ?? "./auth_state", selfChat = false) {
+        this.selfChat = selfChat;
+    }
+
+    setSelfChat(on: boolean): void {
+        if (this.selfChat === on) return;
+        this.selfChat = on;
+        this.warnedSelfChat = false;
+        console.log(`[whatsapp] self-chat mode ${on ? "on" : "off"}`);
+    }
 
     onBroadcast(fn: (method: string, params: any) => void): void {
         this.broadcastFn = fn;
@@ -65,6 +80,7 @@ export class WhatsAppChannel implements IChannel {
     async start(): Promise<void> {
         if (this.waStarted) return;
         this.waStarted = true;
+        this.stopped = false;
         this.status = { state: "starting" };
 
         const baileys = await import("@whiskeysockets/baileys");
@@ -103,10 +119,19 @@ export class WhatsAppChannel implements IChannel {
         await this.start();
     }
 
+    // Disconnects and stays disconnected (the login is kept, so start() later
+    // reconnects without a new QR).
     async stop(): Promise<void> {
-        if (this.sock) {
-            await this.sock.end();
-            this.sock = null;
+        this.stopped = true;
+        this.waStarted = false;
+        const sock = this.sock;
+        this.sock = null;
+        if (sock) {
+            try {
+                await sock.end(undefined);
+            } catch {
+                // already closed
+            }
         }
         this.status = { state: "disconnected" };
     }
@@ -141,16 +166,24 @@ export class WhatsAppChannel implements IChannel {
         if (type !== "notify") return;
         // People only (phone numbers or their privacy ids), not bots or channels.
         if (!jid.endsWith("@s.whatsapp.net") && !jid.endsWith("@lid")) return;
-        if (!hasUserContent(msg.message)) return;
-        const lastOwner = this.ownerActive.get(WhatsAppChannel.userPart(jid)) ?? 0;
-        if (Date.now() - lastOwner < OWNER_ACTIVE_MS) return;
+        if (!hasUserContent(msg.message)) return; // reactions, edits, receipts…
+        const person = canonicalJid(msg.key);
+        const who = maskNumber(person);
+        const ids = personIds(msg.key);
+        const lastOwner = Math.max(0, ...ids.map((id) => this.ownerActive.get(id) ?? 0));
+        if (Date.now() - lastOwner < OWNER_ACTIVE_MS) {
+            console.log(`[whatsapp] away message skipped for ${who}: you wrote in this chat ${Math.round((Date.now() - lastOwner) / 60000)} min ago`);
+            return;
+        }
 
-        const decision = await this.awayHandler({ jid, name: msg.pushName ?? undefined });
+        // One identity per person (their phone number when WhatsApp tells us),
+        // so the "once per repeat interval" record isn't split across ids.
+        const decision = await this.awayHandler({ jid: person, name: msg.pushName ?? undefined });
         if (!decision) return;
         try {
             const sent = await sock.sendMessage(jid, { text: decision.text });
             this.rememberSent(sent?.key?.id);
-            console.log(`[whatsapp] away message sent to ${WhatsAppChannel.userPart(jid)}`);
+            console.log(`[whatsapp] away message sent to ${who}`);
         } catch (err) {
             console.error("[whatsapp] couldn't send the away message:", err);
             await decision.failed().catch(() => {});
@@ -225,6 +258,8 @@ export class WhatsAppChannel implements IChannel {
             }
 
             if (connection === "close") {
+                // A socket from before stop() closing — nothing to do.
+                if (this.stopped || (this.sock && this.sock !== sock)) return;
                 this.sock = null;
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
                 const isLoggedOut = statusCode === this.DisconnectReason?.loggedOut;
@@ -248,7 +283,7 @@ export class WhatsAppChannel implements IChannel {
                     const delay = statusCode === this.DisconnectReason?.restartRequired ? 500 : 5000;
                     console.log(`[whatsapp] reconnecting in ${delay / 1000}s...`);
                     setTimeout(
-                        () => this.createSocket(makeWASocket, state, saveCreds, version, Browsers),
+                        () => { if (!this.stopped) this.createSocket(makeWASocket, state, saveCreds, version, Browsers); },
                         delay,
                     );
                 }
@@ -264,9 +299,13 @@ export class WhatsAppChannel implements IChannel {
 
             for (const msg of messages) {
                 const sentAt = Number(msg.messageTimestamp ?? 0) * 1000;
-                if (sentAt && Date.now() - sentAt > MAX_MESSAGE_AGE_MS) continue;
+                const age = sentAt ? Date.now() - sentAt : 0;
+                // Too old for the bot to answer — but someone who wrote while we
+                // were reconnecting should still get the away message.
+                const lateForAway = age > MAX_MESSAGE_AGE_MS && age <= AWAY_MAX_AGE_MS && type === "notify" && this.selfChat && !msg.key?.fromMe;
+                if (age > MAX_MESSAGE_AGE_MS && !lateForAway) continue;
                 try {
-                    await this.handleUpsert(sock, msg, type);
+                    await this.handleUpsert(sock, msg, type, lateForAway);
                 } catch (err) {
                     console.error("[whatsapp] failed to handle message:", err);
                 }
@@ -274,7 +313,7 @@ export class WhatsAppChannel implements IChannel {
         });
     }
 
-    private async handleUpsert(sock: any, msg: any, type: string = "notify"): Promise<void> {
+    private async handleUpsert(sock: any, msg: any, type: string = "notify", lateOnlyAway = false): Promise<void> {
         if (!msg.message) return;
         const jid: string | undefined = msg.key.remoteJid;
         // One-to-one chats only: no groups, status updates or channels.
@@ -282,7 +321,8 @@ export class WhatsAppChannel implements IChannel {
         if (msg.key.id && this.sentIds.has(msg.key.id)) return;
         if (msg.key.fromMe && !(this.selfChat && this.isSelfChat(jid))) {
             // You wrote in someone's chat yourself (our own sends were skipped above).
-            if (this.selfChat) this.ownerActive.set(WhatsAppChannel.userPart(jid), Date.now());
+            // Remember every id this person goes by (phone number and privacy id).
+            if (this.selfChat) for (const id of personIds(msg.key)) this.ownerActive.set(id, Date.now());
             if (!this.selfChat && this.isSelfChat(jid) && !this.warnedSelfChat) {
                 this.warnedSelfChat = true;
                 console.log("[whatsapp] ignoring a message you sent to yourself on the bot's own number — set WHATSAPP_SELF_CHAT=true to chat with the bot that way");
@@ -296,8 +336,10 @@ export class WhatsAppChannel implements IChannel {
             await this.maybeSendAway(sock, msg, jid, type);
             return;
         }
+        if (lateOnlyAway) return;
 
-        const m = msg.message;
+        // Disappearing-message / view-once / edited wrappers hide the real content.
+        const m = unwrapMessage(msg.message);
         let text: string =
             m.conversation ??
             m.extendedTextMessage?.text ??
@@ -358,10 +400,47 @@ export class WhatsAppChannel implements IChannel {
     }
 }
 
+// WhatsApp wraps content for disappearing messages, view-once media, edits
+// and messages synced from your other devices; the real content is inside.
+const WRAPPERS = ["ephemeralMessage", "viewOnceMessage", "viewOnceMessageV2", "viewOnceMessageV2Extension",
+    "documentWithCaptionMessage", "editedMessage", "deviceSentMessage", "botInvokeMessage"];
+export function unwrapMessage(m: any): any {
+    let cur = m;
+    for (let depth = 0; cur && depth < 6; depth++) {
+        const key = WRAPPERS.find((k) => cur[k]?.message);
+        if (!key) break;
+        cur = cur[key].message;
+    }
+    return cur;
+}
+
 // A real message from a person — not a reaction, edit, receipt or key update.
-function hasUserContent(m: any): boolean {
+export function hasUserContent(raw: any): boolean {
+    const m = unwrapMessage(raw);
     if (!m) return false;
-    return !!(m.conversation || m.extendedTextMessage || m.imageMessage || m.videoMessage || m.audioMessage ||
-        m.documentMessage || m.documentWithCaptionMessage || m.stickerMessage || m.contactMessage ||
-        m.contactsArrayMessage || m.locationMessage || m.liveLocationMessage);
+    return !!(m.conversation || m.extendedTextMessage || m.imageMessage || m.videoMessage || m.ptvMessage || m.audioMessage ||
+        m.documentMessage || m.stickerMessage || m.contactMessage || m.contactsArrayMessage || m.locationMessage ||
+        m.liveLocationMessage || m.pollCreationMessage || m.pollCreationMessageV2 || m.pollCreationMessageV3 ||
+        m.listResponseMessage || m.buttonsResponseMessage || m.templateButtonReplyMessage || m.interactiveResponseMessage ||
+        m.eventMessage || m.groupInviteMessage);
+}
+
+// Every id a person shows up under: their phone number and their privacy id
+// ("@lid"). WhatsApp may use either for the same chat.
+export function personIds(key: any): string[] {
+    const user = (jid?: string) => (jid ?? "").split("@")[0].split(":")[0];
+    return [...new Set<string>([key?.remoteJid, key?.remoteJidAlt, key?.participant, key?.participantAlt].filter(Boolean).map(user))];
+}
+
+// The id to remember a person by: their phone-number jid when known.
+export function canonicalJid(key: any): string {
+    const ids = [key?.remoteJid, key?.remoteJidAlt].filter((j): j is string => typeof j === "string");
+    const phone = ids.find((j) => j.endsWith("@s.whatsapp.net"));
+    return (phone ?? ids[0] ?? "").replace(/:\d+@/, "@");
+}
+
+// "919876543210@s.whatsapp.net" → "+9198…10" for logs.
+function maskNumber(jid: string): string {
+    const n = jid.split("@")[0];
+    return jid.endsWith("@lid") ? `privacy id …${n.slice(-4)}` : `+${n.slice(0, 4)}…${n.slice(-2)}`;
 }

@@ -34,7 +34,7 @@ export class AgentRoutes extends BaseRouter<AgentService> {
         const uid = (req: Request) => req.user!.sub;
         const p = (req: Request, key: string) => String(req.params[key]);
 
-        r.get("/catalog", this.h(async (req, res) => res.json(this.service.catalog(req.user?.email))));
+        r.get("/catalog", this.h(async (req, res) => res.json(await this.service.catalog(req.user?.email, req.user!.sub))));
 
         // "Describe it" → draft configuration (nothing is saved)
         r.post("/draft", this.h(async (req, res) => res.json(await this.service.draft(uid(req), req.body?.description))));

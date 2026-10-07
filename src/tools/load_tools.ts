@@ -10,6 +10,8 @@ export interface ToolContext {
     db: IDatabaseAdapter;
     // Who the tool runs for — tools must only touch this user's data.
     userId?: string;
+    // The chat the tool runs in (e.g. to attach a created document to it).
+    sessionId?: string;
 }
 
 export interface ToolDefinition {

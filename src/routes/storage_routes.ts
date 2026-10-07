@@ -13,6 +13,9 @@ const upload = multer({
 });
 
 const MAX_CONCURRENT_FILE_OPS = 5;
+// Indexing embeds every chunk, so keep fewer in flight than plain uploads.
+const MAX_CONCURRENT_INDEX = 2;
+const MAX_INDEX_PER_REQUEST = 200;
 
 export class StorageRoutes extends BaseRouter<IFileStore> {
     constructor(storage: IFileStore, private embedder: Embedder, private kb: KnowledgeBase) {
@@ -57,7 +60,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                 // listing is paginated.
                 if (search) {
                     const matches = await this.searchFiles(prefix, search);
-                    return res.status(200).json({ files: matches, continuationToken: undefined });
+                    return res.status(200).json({ files: await this.withRag(req.user!.sub, matches), continuationToken: undefined });
                 }
 
                 const result = await this.service.list(prefix, continuationToken, { includeUrls: true });
@@ -68,12 +71,37 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                 // meant `hasNextPage` was always false after page 1, so "Next"
                 // stayed disabled forever regardless of how many files existed.
                 return res.status(200).json({
-                    files: result.files,
+                    files: await this.withRag(req.user!.sub, result.files),
                     continuationToken: result.nextToken,
                 });
             } catch (error) {
                 next(error);
             }
+        }));
+
+        // Builds the search index (RAG) for files already in storage — e.g.
+        // files that were in the bucket before this server was installed.
+        // Body: { keys: string[] } for specific files, or { all: true } for
+        // every file of the user that isn't indexed yet.
+        this.router.post("/index_files", this.asyncHandler(async (req, res) => {
+            const userId = req.user!.sub;
+            const { keys, all } = req.body ?? {};
+            let targets: string[];
+            if (all === true) {
+                targets = await this.unindexedKeys(userId);
+            } else if (Array.isArray(keys) && keys.length > 0 && keys.every((k) => typeof k === "string")) {
+                targets = [...new Set<string>(keys)];
+            } else {
+                return res.status(400).json({ message: "Send { keys: [...] } or { all: true }" });
+            }
+            if (targets.some((k) => !k.startsWith(`${userId}/`) || k.includes(".."))) {
+                return res.status(403).json({ message: "You can only index your own files" });
+            }
+            const remaining = Math.max(0, targets.length - MAX_INDEX_PER_REQUEST);
+            targets = targets.slice(0, MAX_INDEX_PER_REQUEST);
+            const results = await this.runWithConcurrency(targets, MAX_CONCURRENT_INDEX, (key) => this.kb.indexStoredFile(userId, key));
+            const indexed = results.filter((r) => r.status === "indexed").length;
+            return res.status(200).json({ indexed, failed: results.length - indexed, remaining, results });
         }));
 
         this.router.delete("/delete", this.asyncHandler(async (req, res, next) => {
@@ -162,6 +190,34 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
         return matches;
     }
 
+
+    private async withRag(userId: string, files: ListResult["files"]) {
+        try {
+            const statuses = await this.kb.ragStatuses(userId, files.map((f) => f.key));
+            return files.map((f) => ({ ...f, rag: statuses.get(f.key) }));
+        } catch (error) {
+            // The file list still works if the vector DB is unreachable.
+            console.error("[list_files] could not read the search-index status:", error);
+            return files;
+        }
+    }
+
+    // Every file of the user that can be indexed but isn't (Markdown copies
+    // of other files are skipped — they are searchable through the original).
+    private async unindexedKeys(userId: string): Promise<string[]> {
+        const prefix = `${userId}/`;
+        const keys: string[] = [];
+        let token: string | undefined;
+        let pages = 0;
+        do {
+            const page = await this.service.list(prefix, token);
+            keys.push(...page.files.map((f) => f.key));
+            token = page.nextToken;
+            pages += 1;
+        } while (token && pages < this.SEARCH_MAX_PAGES);
+        const statuses = await this.kb.ragStatuses(userId, keys);
+        return keys.filter((k) => statuses.get(k)?.status === "not_indexed");
+    }
 
     private async runWithConcurrency<T, R>(
         items: T[],

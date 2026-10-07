@@ -156,9 +156,11 @@ export class LLMFactory {
             model,
             models: LLMFactory.modelList(model, process.env.OPENAI_MODELS ?? ""),
             temperature,
+            // Long enough for a full document/report in one answer (gpt-4o and
+            // gpt-4o-mini allow 16,384 output tokens).
             maxTokens: process.env.LLM_MAX_TOKENS
                 ? parseInt(process.env.LLM_MAX_TOKENS, 10)
-                : 4096,
+                : 16384,
         };
     }
 

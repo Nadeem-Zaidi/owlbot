@@ -43,6 +43,16 @@ import { BillingRepository } from "./repository/billing_repository";
 import { BillingService } from "./service/billing/billing_service";
 import { createBillingRouter, createBillingWebhookRouter } from "./routes/billing_routes";
 import { closeRedis } from "./infra/redis";
+import { LLMKeyRepository } from "./repository/llm_key_repository";
+import { ModelRegistry } from "./service/model_registry";
+import { createLLMKeyRouter } from "./routes/llm_key_routes";
+import { SettingsRepository } from "./repository/settings_repository";
+import { SettingsService } from "./service/settings_service";
+import { WhatsAppManager } from "./service/whatsapp_manager";
+import { createAdminRouter } from "./routes/admin_routes";
+import { ArtifactRepository } from "./repository/artifact_repository";
+import { createArtifactTools } from "./tools/artifact_tools";
+import { createArtifactRouter } from "./routes/artifact_routes";
 dotenv.config();
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
@@ -86,6 +96,10 @@ async function wa() {
     const embed = new EmbedderAdapter(embedder);
     const toolRegistry = new LLMTool();
     toolRegistry.registerBuiltin(createVectorSearchTool(vectorDb, embed));
+    // Documents/reports shown in a side panel (any model that supports tools).
+    const artifactRepo = new ArtifactRepository(db);
+    const artifactTools = createArtifactTools(artifactRepo);
+    for (const t of artifactTools) toolRegistry.registerBuiltin(t);
     const { providers, defaultProvider } = LLMFactory.createAllFromEnv(chatMessageService, toolRegistry, s3Client);
     // Record token usage for every chat turn, whichever feature started it.
     const usageRepo = new UsageRepository(db);
@@ -95,6 +109,16 @@ async function wa() {
     console.log(`[billing] payments ${billing.paymentsEnabled ? "on" : "off (no Razorpay keys)"}; quotas ${process.env.BILLING_ENABLED === "true" ? "enforced" : "not enforced (BILLING_ENABLED != true)"}`);
     for (const [id, llm] of providers) providers.set(id, new UsageTrackingLLM(llm, usageRepo));
     console.log(`[app] LLM providers: ${[...providers.keys()].join(", ")} (default: ${defaultProvider})`);
+    // The server's providers plus each user's own API keys (BYOK).
+    const modelRegistry = new ModelRegistry({
+        platform: providers,
+        defaultProvider,
+        repo: new LLMKeyRepository(db),
+        usage: usageRepo,
+        messageService: chatMessageService,
+        tools: toolRegistry,
+        fileStore: s3Client,
+    });
     const knowledgeBase = new KnowledgeBase(s3Client, embedder, vectorDb);
     const agentRepo = new AgentRepository(db);
     const agentService = new AgentService({
@@ -106,6 +130,8 @@ async function wa() {
         vectorDb,
         embed,
         usage: usageRepo,
+        registry: modelRegistry,
+        alwaysTools: artifactTools,
     });
     // Provider-native agents (Claude Managed Agents / OpenAI Agents API), for
     // each provider that has an API key.
@@ -124,34 +150,39 @@ async function wa() {
     });
     const chatRoutes = new ChatMessages(chatMessageService, providers, defaultProvider, agentService, nativeAgentService, knowledgeBase);
     chatRoutes.billing = billing;
+    chatRoutes.registry = modelRegistry;
     const storageRoutes = new StorageRoutes(s3Client, embedder, knowledgeBase);
 
-    // WhatsApp is opt-in: set WHATSAPP_ENABLED=true. On first run the server
-    // prints a QR in the terminal — scan it from the bot's phone (WhatsApp →
-    // Linked devices) once; the session is then kept in WHATSAPP_AUTH_DIR.
+    // WhatsApp is turned on/off in Server settings (stored in Postgres; .env
+    // only seeds the first value). The first time, open the web app → Connect
+    // WhatsApp and scan the QR from the bot's phone; the login is kept in
+    // WHATSAPP_AUTH_DIR. One login can't run in two processes, so only the
+    // primary worker hosts it — and in a multi-server setup only the instance
+    // without WHATSAPP_HOST=false.
     const whatsappRepo = new WhatsAppRepository(db);
-    let whatsappBridge: WhatsAppBridge | null = null;
-    if (process.env.WHATSAPP_ENABLED === "true" && primaryWorker) {
-        const channel = new WhatsAppChannel();
-        whatsappBridge = new WhatsAppBridge({
+    const settingsService = new SettingsService(new SettingsRepository(db));
+    await settingsService.seedFromEnv();
+    const whatsappManager = new WhatsAppManager({
+        settings: settingsService,
+        canHost: primaryWorker && process.env.WHATSAPP_HOST !== "false",
+        makeBridge: (channel) => new WhatsAppBridge({
             channel,
             repo: whatsappRepo,
             messageService: chatMessageService,
             providers,
             defaultProvider,
             kb: knowledgeBase,
-        });
-        whatsappBridge.start();
-        // Don't block or crash the web app if WhatsApp can't connect.
-        channel.start().catch((err) => console.error("[whatsapp] failed to start:", err));
-    }
-    const whatsappRoutes = new WhatsAppRoutes(chatMessageService, whatsappRepo, whatsappBridge);
+            registry: modelRegistry,
+        }),
+    });
+    await whatsappManager.init();
+    const whatsappRoutes = new WhatsAppRoutes(chatMessageService, whatsappRepo, whatsappManager, settingsService);
 
     // Scheduled agent runs; results can also go to the user's WhatsApp.
     const agentScheduler = new AgentScheduler(
         agentRepo,
         agentService,
-        whatsappBridge ? (userId, text) => whatsappBridge!.notifyUser(userId, text) : undefined,
+        (userId, text) => whatsappManager.bridge ? whatsappManager.bridge.notifyUser(userId, text) : Promise.resolve(false),
     );
     // Safe on several servers (each slot is claimed atomically); turn off with
     // SCHEDULER_ENABLED=false to run it only on chosen instances.
@@ -170,6 +201,9 @@ async function wa() {
         { path: "/api/usage", router: usageRouter },
         { path: "/api/native-agents", router: createNativeAgentRouter(nativeAgentService) },
         { path: "/api/billing", router: createBillingRouter(billing) },
+        { path: "/api/llm-keys", router: createLLMKeyRouter(modelRegistry) },
+        { path: "/api/artifacts", router: createArtifactRouter(artifactRepo) },
+        { path: "/api/admin", router: createAdminRouter(settingsService, whatsappManager) },
     ], [
         { path: "/api/billing/webhook", router: createBillingWebhookRouter(billing) },
     ]);
@@ -184,6 +218,7 @@ async function wa() {
         stopping = true;
         console.log(`[app] ${signal} — shutting down`);
         agentScheduler.stop();
+        await whatsappManager.stop().catch(() => {});
         await gateway.close(Number(process.env.SHUTDOWN_GRACE_MS ?? 25_000));
         await Promise.allSettled([closeRedis(), db.disconnect()]);
         process.exit(0);

@@ -9,7 +9,7 @@ import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
 import { IFileStore } from "../interfaces/ifilestore";
 import { windowHistory } from "./history_window";
-import { usageIncrement } from "./usage_tracking";
+import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 
 
@@ -300,6 +300,10 @@ export class OpenAIProvider implements ILLM {
             const codeInterpreterCalls = new Map<string, { id: string; container_id?: string; code: string; status: string }>();
             let calledAnyToolThisTurn = false;
             const wireTools = [...functionTools, ...mcpTools, ...buildCodeInterpreterTools()];
+            // For an estimate if the user stops this request before it completes.
+            const requestChars = JSON.stringify(inputMessages).length + JSON.stringify(wireTools).length;
+            let roundOutputChars = 0;
+            let roundBilled = false;
             try {
                 const res = await fetch(this.baseUrl, {
                     method: "POST",
@@ -363,6 +367,7 @@ export class OpenAIProvider implements ILLM {
                 while (true) {
                     if (signal.aborted) {
                         await reader.cancel();
+                        if (!roundBilled) { roundBilled = true; yield estimatedUsageIncrement(requestChars, roundOutputChars, activeModel); }
                         await this.savePartialReply(sessionId, pendingText, activeModel);
                         pendingText = "";
                         continueLoop = false;
@@ -394,6 +399,7 @@ export class OpenAIProvider implements ILLM {
 
                         if (event.type === "response.output_text.delta") {
                             pendingText += event.delta ?? "";
+                            roundOutputChars += (event.delta ?? "").length;
                             yield {
                                 type: "message",
                                 role: "assistant",
@@ -610,7 +616,7 @@ export class OpenAIProvider implements ILLM {
                                         throw new Error(`Model produced invalid JSON arguments for "${item.name}": ${item.arguments}`);
                                     }
 
-                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId });
+                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId, sessionId });
                                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                                     yield {
                                         type: "function_call_output",
@@ -710,7 +716,7 @@ export class OpenAIProvider implements ILLM {
 
                         if (event.type === "response.completed") {
                             sawResponseCompleted = true;
-                            if (event.response?.usage) yield usageIncrement(openaiUsage(event.response.usage), event.response.model ?? activeModel);
+                            if (event.response?.usage) { roundBilled = true; yield usageIncrement(openaiUsage(event.response.usage), event.response.model ?? activeModel); }
                             if (!functionCallTools.size && !mcpCallTools.size) {
                                 if (calledAnyToolThisTurn) {
                                     break readLoop;
@@ -738,6 +744,7 @@ export class OpenAIProvider implements ILLM {
 
             } catch (err: any) {
                 if (err?.name === "AbortError") {
+                    if (!roundBilled) { roundBilled = true; yield estimatedUsageIncrement(requestChars, roundOutputChars, activeModel); }
                     await this.savePartialReply(sessionId, pendingText, activeModel);
                     pendingText = "";
                     yield { type: "cancelled", content: [{ type: "aborted", text: "Request cancelled." }] };

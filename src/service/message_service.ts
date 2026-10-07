@@ -62,6 +62,15 @@ export class  MessageService{
         await this.sessionRepository.deleteSession(sessionId,userId)
     }
 
+    // Favourite chats, shown under "Pinned" in the sidebar.
+    async setPinned(sessionId: string, userId: string, pinned: boolean) {
+        return this.sessionRepository.setPinned(sessionId, userId, pinned);
+    }
+
+    async countPinned(userId: string) {
+        return this.sessionRepository.countPinned(userId);
+    }
+
     async loadMessages(sessionId:string):Promise<LLMMessage[]>{
         const messages=await this.messageRepository.getSessionMessages(sessionId)
         return messages

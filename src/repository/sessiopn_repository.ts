@@ -41,7 +41,7 @@ export class SessionRepository {
         const result = await this.db.query<Session>(
             `SELECT s.id, s.title, s.source, s.agent_id, s.native_agent_id,
                     COALESCE(a.icon, na.icon) AS agent_icon, COALESCE(a.name, na.name) AS agent_name,
-                    na.provider AS native_provider, s.updated_at
+                    na.provider AS native_provider, s.updated_at, s.pinned_at
              FROM sessions s
              LEFT JOIN agents a ON a.id = s.agent_id
              LEFT JOIN native_agents na ON na.id = s.native_agent_id
@@ -50,6 +50,22 @@ export class SessionRepository {
             [userId]
         );
         return result.rows;
+    }
+
+    // Pins (favourites) or unpins a chat. Doesn't touch updated_at, so pinning
+    // doesn't move it in Recents. Returns null if it isn't this user's chat.
+    async setPinned(sessionId: string, userId: string, pinned: boolean): Promise<{ id: string; pinned_at: Date | null } | null> {
+        const result = await this.db.query<{ id: string; pinned_at: Date | null }>(
+            `UPDATE sessions SET pinned_at = CASE WHEN $3 THEN COALESCE(pinned_at, now()) ELSE NULL END
+             WHERE id = $1 AND userid = $2 RETURNING id, pinned_at`,
+            [sessionId, userId, pinned]
+        );
+        return result.rows[0] ?? null;
+    }
+
+    async countPinned(userId: string): Promise<number> {
+        const result = await this.db.query<{ n: number }>(`SELECT count(*)::int AS n FROM sessions WHERE userid = $1 AND pinned_at IS NOT NULL`, [userId]);
+        return result.rows[0]?.n ?? 0;
     }
 
     async getSessionMessages(sessionId: string, userId: string) {

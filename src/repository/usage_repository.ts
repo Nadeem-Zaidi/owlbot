@@ -15,6 +15,9 @@ export type UsageEntry = TokenCounts & {
     provider?: string | null;
     model?: string | null;
     requests?: number;
+    // Ran on the user's own API key: shown in reports, never counted toward the plan.
+    byok?: boolean;
+    keyId?: string | null;
 };
 
 export const emptyCounts = (): TokenCounts => ({ input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 });
@@ -36,13 +39,14 @@ export class UsageRepository {
         // work after the chat is deleted.
         await this.db.query(
             `INSERT INTO token_usage (user_id, session_id, agent_id, source, kind, provider, model,
-                                      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requests)
+                                      input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, requests, byok, key_id)
              VALUES ($1, $2,
                      COALESCE($3, (SELECT agent_id FROM sessions WHERE id = $2)),
                      (SELECT source FROM sessions WHERE id = $2),
-                     $4, $5, $6, $7, $8, $9, $10, $11)`,
+                     $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
             [e.userId, e.sessionId ?? null, e.agentId ?? null, e.kind, e.provider ?? null, e.model ?? null,
-             e.input_tokens, e.output_tokens, e.cache_read_tokens, e.cache_write_tokens, e.requests ?? 1]
+             e.input_tokens, e.output_tokens, e.cache_read_tokens, e.cache_write_tokens, e.requests ?? 1,
+             e.byok ?? false, e.keyId ?? null]
         );
     }
 
@@ -65,13 +69,13 @@ export class UsageRepository {
     async summary(userId: string, days: number) {
         const since = [userId, days];
         const where = `user_id = $1 AND created_at >= now() - ($2 || ' days')::interval`;
-        const [totals, byDay, byModel, bySource, topChats] = await Promise.all([
+        const [totals, byDay, byModel, bySource, topChats, byok] = await Promise.all([
             this.db.query<Grouped>(`SELECT ${SUMS} FROM token_usage WHERE ${where}`, since),
             this.db.query<Grouped & { day: string }>(
                 `SELECT to_char(date_trunc('day', created_at), 'YYYY-MM-DD') AS day, ${SUMS}
                  FROM token_usage WHERE ${where} GROUP BY 1 ORDER BY 1`, since),
-            this.db.query<Grouped & { provider: string | null; model: string | null }>(
-                `SELECT provider, model, ${SUMS} FROM token_usage WHERE ${where} GROUP BY 1, 2 ORDER BY 1, 2`, since),
+            this.db.query<Grouped & { provider: string | null; model: string | null; byok: boolean }>(
+                `SELECT provider, model, byok, ${SUMS} FROM token_usage WHERE ${where} GROUP BY 1, 2, 3 ORDER BY 1, 2, 3`, since),
             this.db.query<Grouped & { source: string }>(
                 `SELECT CASE WHEN kind = 'agent_draft' THEN 'agent_builder'
                              WHEN source = 'whatsapp' THEN 'whatsapp'
@@ -86,8 +90,9 @@ export class UsageRepository {
                  GROUP BY 1, 2
                  ORDER BY SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens) DESC
                  LIMIT 10`, since),
+            this.db.query<Grouped>(`SELECT ${SUMS} FROM token_usage WHERE ${where} AND byok`, since),
         ]);
-        return { totals: totals.rows[0], byDay: byDay.rows, byModel: byModel.rows, bySource: bySource.rows, topChats: topChats.rows };
+        return { totals: totals.rows[0], byok: byok.rows[0], byDay: byDay.rows, byModel: byModel.rows, bySource: bySource.rows, topChats: topChats.rows };
     }
 
     async sessionTotals(userId: string, sessionId: string): Promise<Grouped> {

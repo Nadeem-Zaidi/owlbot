@@ -27,7 +27,8 @@ export const BUILTIN_TOOLS = [
 export type BuiltinToolId = (typeof BUILTIN_TOOLS)[number]["id"];
 export const BUILTIN_TOOL_IDS = new Set<string>(BUILTIN_TOOLS.map((t) => t.id));
 
-export type BuiltinDeps = { vectorDb: IVectorDb; embed: EmbeddingProvider; kb: KnowledgeBase };
+// `alwaysTools`: tools every agent gets (e.g. creating documents in the side panel).
+export type BuiltinDeps = { vectorDb: IVectorDb; embed: EmbeddingProvider; kb: KnowledgeBase; alwaysTools?: ToolDefinition[] };
 
 function builtinTool(id: string, deps: BuiltinDeps, documentKeys: string[]): ToolDefinition | null {
     const inScope = (key: string) => !documentKeys.length || documentKeys.includes(key);
@@ -236,5 +237,6 @@ export function buildAgentToolSet(
     for (const fn of functions) if (fn.enabled) tools.push(httpFunctionTool(fn));
     for (const fn of codeFunctions) if (fn.enabled) tools.push(codeFunctionTool(fn));
     for (const s of servers) tools.push(...mcpTools(s, pool));
+    tools.push(...(deps.alwaysTools ?? []));
     return new AgentToolSet(tools);
 }
