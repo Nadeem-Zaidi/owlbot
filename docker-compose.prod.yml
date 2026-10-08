@@ -1,7 +1,10 @@
 # Scaled production stack:
 #
 #   nginx (load balancer :80) ──► api × N  (stateless; each runs CLUSTER_WORKERS processes)
-#                              └► jobs × 1 (WhatsApp + scheduler; /api/whatsapp/* goes here)
+#                              └► jobs × 1 (WhatsApp, Telegram, scheduler)
+#   api ⇄ jobs through Redis: any api instance serves /api/whatsapp and /api/telegram
+#   (status is shared, commands like "pair" are forwarded to jobs), and live
+#   events (/api/events WebSocket) reach the browser whichever instance it's on.
 #   api/jobs ──► pgbouncer ──► postgres (pgvector)      api/jobs ──► redis (rate limits, approvals)
 #   api/jobs ──► converter (Python gRPC: documents → Markdown, code functions)
 #
@@ -46,10 +49,9 @@ services:
     environment:
       <<: *app-env
       CLUSTER_WORKERS: ${API_WORKERS:-2}
-      # Single-instance jobs run in the "jobs" service instead. (WhatsApp on/off
-      # itself is a Server setting in the web app; this only says where it may run.)
-      WHATSAPP_HOST: "false"
-      SCHEDULER_ENABLED: "false"
+      # HTTP only. WhatsApp, Telegram and the scheduler run in "jobs" (their
+      # on/off is a Server setting in the web app; ROLE only says where).
+      ROLE: api
     deploy:
       replicas: ${API_REPLICAS:-3}
     expose:
@@ -60,10 +62,9 @@ services:
     environment:
       <<: *app-env
       CLUSTER_WORKERS: "1"
-      WHATSAPP_HOST: "true"
+      ROLE: jobs
       # First boot only: seeds the Server setting (change it in the web app later).
       WHATSAPP_ENABLED: ${WHATSAPP_ENABLED:-false}
-      SCHEDULER_ENABLED: "true"
     volumes:
       - whatsapp_auth:/app/auth_state
     expose:

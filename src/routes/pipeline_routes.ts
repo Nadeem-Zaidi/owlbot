@@ -28,6 +28,11 @@ export class PipelineRoutes extends BaseRouter<PipelineService> {
         r.get("/", this.h(async (req, res) => res.json({ pipelines: await this.service.list(uid(req)) })));
         r.post("/", this.h(async (req, res) => res.status(201).json(await this.service.create(uid(req), req.body))));
         r.get("/runs/:runId", this.h(async (req, res) => res.json(await this.service.getRun(uid(req), Number(p(req, "runId"))))));
+        // Workflows: runs waiting for your approval; approve/reject; cancel.
+        r.get("/approvals", this.h(async (req, res) => res.json({ runs: await this.service.approvals(uid(req)) })));
+        r.post("/runs/:runId/decision", this.h(async (req, res) =>
+            res.json(await this.service.decide(uid(req), Number(p(req, "runId")), { ...req.body, by: req.user!.email ?? req.user!.sub }))));
+        r.post("/runs/:runId/cancel", this.h(async (req, res) => res.json(await this.service.cancel(uid(req), Number(p(req, "runId"))))));
         r.get("/:id", this.h(async (req, res) => res.json(await this.service.get(uid(req), p(req, "id")))));
         r.put("/:id", this.h(async (req, res) => res.json(await this.service.update(uid(req), p(req, "id"), req.body))));
         r.delete("/:id", this.h(async (req, res) => {

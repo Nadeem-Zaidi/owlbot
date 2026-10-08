@@ -22,7 +22,10 @@ export function createInsightsRouters(search: SearchRepository, usage: UsageRepo
         const q = typeof req.query.q === "string" ? req.query.q.trim() : "";
         if (q.length < 2) return res.json({ query: q, results: [] });
         if (q.length > 200) return res.status(400).json({ message: "Search text is too long" });
-        return res.json({ query: q, results: await search.searchChats(req.user!.sub, q) });
+        const limit = Math.min(50, Math.max(1, Number(req.query.limit) || 30));
+        const offset = Math.min(1000, Math.max(0, Math.floor(Number(req.query.offset) || 0)));
+        const { results, hasMore } = await search.searchChats(req.user!.sub, q, limit, offset);
+        return res.json({ query: q, results, nextOffset: hasMore ? offset + results.length : null });
     }));
 
     const usageRouter = Router();

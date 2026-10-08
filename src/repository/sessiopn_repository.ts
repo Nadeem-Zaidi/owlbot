@@ -12,7 +12,7 @@ export class SessionRepository {
     }
 
     // `source` records where the chat started ("web" or "whatsapp").
-    public async createSession(userId: string, source: "web" | "whatsapp" | "pipeline" = "web", title?: string) {
+    public async createSession(userId: string, source: "web" | "whatsapp" | "telegram" | "pipeline" = "web", title?: string) {
         const result = await this.db.query<Session>(
             `INSERT INTO sessions (id, userid, source, title) VALUES ($1, $2, $3, COALESCE($4, 'New Chat')) RETURNING *`,
             [randomUUID(), userId, source, title ?? null]
@@ -50,6 +50,40 @@ export class SessionRepository {
             [userId]
         );
         return result.rows;
+    }
+
+    // One page of the user's chats, newest activity first, for the "All
+    // chats" list on the Search page. Keyset pagination on (updated_at, id):
+    // `after` is the cursor_ts/id of the last row of the previous page.
+    // cursor_ts is updated_at as text, so it keeps Postgres' microsecond
+    // precision (a JS Date would round it and skip or repeat rows).
+    async getUserSessionsPage(userId: string, limit: number, after?: { ts: string; id: string }) {
+        const params: unknown[] = [userId, limit + 1];
+        let cursorSql = "";
+        if (after) {
+            params.push(after.ts, after.id);
+            cursorSql = "AND (s.updated_at, s.id) < ($3::timestamptz, $4::text)";
+        }
+        const result = await this.db.query<Session & { cursor_ts: string }>(
+            `SELECT s.id, s.title, s.source, s.agent_id, s.native_agent_id,
+                    COALESCE(a.icon, na.icon) AS agent_icon, COALESCE(a.name, na.name) AS agent_name,
+                    na.provider AS native_provider, s.updated_at, s.pinned_at, s.updated_at::text AS cursor_ts
+             FROM sessions s
+             LEFT JOIN agents a ON a.id = s.agent_id
+             LEFT JOIN native_agents na ON na.id = s.native_agent_id
+             WHERE s.userid = $1 AND s.source <> 'pipeline' ${cursorSql}
+             ORDER BY s.updated_at DESC, s.id DESC
+             LIMIT $2`,
+            params
+        );
+        const rows = result.rows;
+        const hasMore = rows.length > limit;
+        const page = rows.slice(0, limit);
+        const last = page[page.length - 1];
+        return {
+            sessions: page.map(({ cursor_ts: _c, ...s }) => s),
+            next: hasMore && last ? { ts: last.cursor_ts, id: last.id } : null,
+        };
     }
 
     // Pins (favourites) or unpins a chat. Doesn't touch updated_at, so pinning

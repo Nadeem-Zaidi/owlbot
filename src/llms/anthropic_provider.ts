@@ -7,7 +7,7 @@ import { LLMTool } from "../tools/tool_registry";
 import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
 import { ToolDefinition } from "../types/type";
-import { windowHistory } from "./history_window";
+import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 
@@ -227,6 +227,22 @@ export class AnthropicProvider implements ILLM {
         return missing.length ? `missing required field(s): ${missing.join(", ")}` : null;
     }
 
+    // One-shot completion for the context engine's summaries (provider's default model, like titles).
+    private async summarizeText(system: string, text: string): Promise<{ text: string; usage?: TokenCounts; model?: string }> {
+        const response = await this.client.beta.messages.create({
+            model: this.config.model,
+            max_tokens: 2000,
+            system,
+            ...this.requestOptions(this.config.model, "low"),
+            messages: [{ role: "user", content: text }],
+        });
+        const out = response.content
+            .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
+            .map((b) => b.text)
+            .join("");
+        return { text: out, usage: anthropicUsage(response.usage), model: response.model };
+    }
+
     async summarizeChat(transcript: string): Promise<string> {
         return (await this.generateTitle(transcript)).title;
     }
@@ -261,8 +277,13 @@ export class AnthropicProvider implements ILLM {
         const toolset: ToolSource = run?.tools ?? this.tools;
         await this.messageService.runTransaction(sessionId, messages);
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
-        // Only the newest part of a long chat is sent; the full history stays stored.
-        const { system: storedSystem, messages: history } = this.fromInput(windowHistory(userSessionMessages));
+        // The context engine picks what part of the stored history is sent
+        // (recent messages + a summary of older ones); everything stays stored.
+        const context = await contextEngine().assemble(userSessionMessages, {
+            sessionId, userId, skillScope: run?.skillScope, model: activeModel, summarize: (system, text) => this.summarizeText(system, text),
+        });
+        for (const u of context.usage) yield usageIncrement(u.usage, u.model, "compaction");
+        const { system: storedSystem, messages: history } = this.fromInput(context.messages);
         const system = [run?.systemPrompt, storedSystem].filter(Boolean).join("\n\n");
         const tools = this.toolDefinitions(toolset);
 

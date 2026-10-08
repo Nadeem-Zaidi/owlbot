@@ -8,7 +8,7 @@ import { LLMTool } from "../tools/tool_registry";
 import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
 import { IFileStore } from "../interfaces/ifilestore";
-import { windowHistory } from "./history_window";
+import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 
@@ -169,6 +169,19 @@ export class OpenAIProvider implements ILLM {
         throw new Error("Method not implemented.");
     }
 
+    // One-shot completion for the context engine's summaries (provider's default model, like titles).
+    private async summarizeText(system: string, text: string): Promise<{ text: string; usage?: TokenCounts; model?: string }> {
+        const response = await this.client.responses.create({
+            model: this.config.model,
+            input: [
+                { type: "message", role: "system", content: [{ type: "input_text", text: system }] },
+                { type: "message", role: "user", content: [{ type: "input_text", text }] },
+            ] as ResponseInputItem[],
+            max_output_tokens: 1500,
+        });
+        return { text: response.output_text ?? "", usage: openaiUsage(response.usage), model: response.model };
+    }
+
     async summarizeChat(message: ResponseInputItem[]): Promise<string> {
         return (await this.generateTitle(message)).title;
     }
@@ -236,8 +249,13 @@ export class OpenAIProvider implements ILLM {
         const toolset: ToolSource = run?.tools ?? this.tools;
         await this.messageService.runTransaction(sessionId, messages);
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
-        // Only the newest part of a long chat is sent; the full history stays stored.
-        const parseUserSessionMessages = this.fromInput(windowHistory(userSessionMessages));
+        // The context engine picks what part of the stored history is sent
+        // (recent messages + a summary of older ones); everything stays stored.
+        const context = await contextEngine().assemble(userSessionMessages, {
+            sessionId, userId, skillScope: run?.skillScope, model: activeModel, summarize: (system, text) => this.summarizeText(system, text),
+        });
+        for (const u of context.usage) yield usageIncrement(u.usage, u.model, "compaction");
+        const parseUserSessionMessages = this.fromInput(context.messages);
         let inputMessages = [...parseUserSessionMessages];
         if (run?.systemPrompt) {
             inputMessages = [

@@ -1,10 +1,19 @@
 import { ChatRunOptions, ILLM } from "../interfaces/illm";
 import { emptyCounts, TokenCounts, totalTokens, UsageRepository } from "../repository/usage_repository";
 import { LLMMessage, Tool } from "../types/llm_message";
+import { metrics } from "../infra/observability";
+
+function countTokens(provider: string, kind: string, byok: boolean, usage: Partial<TokenCounts>) {
+    const base = { provider, kind, byok };
+    metrics.llmTokens.inc({ ...base, direction: "input" }, (usage.input_tokens || 0) + (usage.cache_read_tokens || 0) + (usage.cache_write_tokens || 0));
+    metrics.llmTokens.inc({ ...base, direction: "output" }, usage.output_tokens || 0);
+}
 
 // Providers report each model call's tokens as an internal chunk:
 //   { type: "usage_increment", usage: TokenCounts, model, kind?: "title" }
-export type UsageIncrement = { type: "usage_increment"; usage: TokenCounts; model?: string; kind?: "chat" | "title" };
+export type UsageIncrement = { type: "usage_increment"; usage: TokenCounts; model?: string; kind?: UsageKind };
+// "compaction": the context engine summarizing older messages of a long chat.
+export type UsageKind = "chat" | "title" | "compaction";
 
 // Providers report usage only when a reply completes. When the user presses
 // Stop, the provider has still billed the input and the output generated so
@@ -17,7 +26,7 @@ export function estimatedUsageIncrement(inputChars: number, outputChars: number,
     }, model);
 }
 
-export function usageIncrement(usage: Partial<TokenCounts>, model?: string, kind: "chat" | "title" = "chat"): LLMMessage {
+export function usageIncrement(usage: Partial<TokenCounts>, model?: string, kind: UsageKind = "chat"): LLMMessage {
     return { type: "usage_increment", usage: { ...emptyCounts(), ...usage }, model, kind } as unknown as LLMMessage;
 }
 
@@ -73,9 +82,12 @@ export class UsageTrackingLLM implements ILLM {
             for await (const chunk of this.inner.chatStream(messages, userId, sessionId, apiKey, signal, model, run)) {
                 if ((chunk as any).type === "usage_increment") {
                     const inc = chunk as unknown as UsageIncrement;
-                    if (inc.kind === "title") {
-                        void this.usage.record({ userId, sessionId, kind: "title", provider: this.inner.getProvider(), model: inc.model, ...own, ...inc.usage })
-                            .catch((e) => console.error("[usage] couldn't record title usage:", e));
+                    if (inc.kind === "title" || inc.kind === "compaction") {
+                        // Side calls get their own row (still on the user's account / own key).
+                        const kind = inc.kind;
+                        countTokens(this.inner.getProvider(), kind, !!this.byok, inc.usage);
+                        void this.usage.record({ userId, sessionId, kind, provider: this.inner.getProvider(), model: inc.model, ...own, ...inc.usage })
+                            .catch((e) => console.error(`[usage] couldn't record ${kind} usage:`, e));
                     } else {
                         add(turn, inc.usage);
                         requests++;
@@ -95,6 +107,7 @@ export class UsageTrackingLLM implements ILLM {
         } finally {
             if (requests > 0) {
                 try {
+                    countTokens(this.inner.getProvider(), "chat", !!this.byok, turn);
                     await this.usage.record({ userId, sessionId, kind: "chat", provider: this.inner.getProvider(), model: servedBy, requests, ...own, ...turn });
                     await this.usage.attachToLastReply(sessionId, startId, summary());
                 } catch (e) {

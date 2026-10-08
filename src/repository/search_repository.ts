@@ -30,7 +30,9 @@ function snippet(text: string, query: string): string {
 export class SearchRepository {
     constructor(private db: IDatabaseAdapter) {}
 
-    async searchChats(userId: string, query: string, limit = 30): Promise<SearchHit[]> {
+    // `offset` pages through the ranked results (infinite scroll); hasMore
+    // says whether another page exists.
+    async searchChats(userId: string, query: string, limit = 30, offset = 0): Promise<{ results: SearchHit[]; hasMore: boolean }> {
         const pattern = likePattern(query);
         // Cheap pre-filter on the whole message (uses the trigram index when
         // present) before expanding its parts. JSON escapes quotes/backslashes,
@@ -42,7 +44,7 @@ export class SearchRepository {
                  FROM sessions s LEFT JOIN agents a ON a.id = s.agent_id
                  WHERE s.userid = $1 AND s.source <> 'pipeline' AND s.title ILIKE $2
                  ORDER BY s.updated_at DESC LIMIT $3`,
-                [userId, pattern, limit]
+                [userId, pattern, offset + limit + 1]
             ),
             // Only what the user actually sees: user/assistant text, not hidden
             // instructions, attached documents or tool output.
@@ -84,8 +86,8 @@ export class SearchRepository {
         }
 
         // Title matches first, then by most matches, then most recent.
-        return [...hits.values()]
-            .sort((a, b) => Number(b.title_match) - Number(a.title_match) || b.match_count - a.match_count || +new Date(b.updated_at) - +new Date(a.updated_at))
-            .slice(0, limit);
+        const ranked = [...hits.values()]
+            .sort((a, b) => Number(b.title_match) - Number(a.title_match) || b.match_count - a.match_count || +new Date(b.updated_at) - +new Date(a.updated_at));
+        return { results: ranked.slice(offset, offset + limit), hasMore: ranked.length > offset + limit };
     }
 }

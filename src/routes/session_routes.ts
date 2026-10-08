@@ -7,15 +7,29 @@ import { ILLM } from "../interfaces/illm";
 import { LLMMessage } from "../types/llm_message";
 import { LLMProvider } from "../llms/llm_factory";
 import { AgentService } from "../service/agents/agent_service";
-import { ChatRunOptions } from "../interfaces/illm";
 import { NativeAgentService } from "../service/native_agents/native_agent_service";
 import { KnowledgeBase } from "../service/knowledge_base";
-import { withAttachmentText } from "../service/attachment_text";
 import { BillingService } from "../service/billing/billing_service";
 import { ModelRegistry } from "../service/model_registry";
+import { AgentRuntime } from "../core/runtime";
 dotenv.config();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 const MAX_PINNED = 50;
+const SESSIONS_PAGE_DEFAULT = 30;
+const SESSIONS_PAGE_MAX = 100;
+
+// Opaque page cursor for GET /sessions: base64url of [updated_at text, id].
+const encodeCursor = (c: { ts: string; id: string }) => Buffer.from(JSON.stringify([c.ts, c.id])).toString("base64url");
+function decodeCursor(raw: string): { ts: string; id: string } | null {
+    try {
+        const v = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
+        if (Array.isArray(v) && v.length === 2 && typeof v[0] === "string" && typeof v[1] === "string"
+            && v[1].length <= 200 && !Number.isNaN(Date.parse(v[0]))) {
+            return { ts: v[0], id: v[1] };
+        }
+    } catch { /* fall through */ }
+    return null;
+}
 
 const PROVIDER_LABELS: Partial<Record<LLMProvider, string>> = {
     openai: "ChatGPT",
@@ -44,6 +58,22 @@ export class ChatMessages extends BaseRouter<MessageService> {
     billing?: BillingService;
     // Server providers + the user's own keys (BYOK). Set from main.ts.
     registry?: ModelRegistry;
+    // Runs every chat turn (shared with WhatsApp and schedules). Set from
+    // main.ts; built from the fields above when not set (tests).
+    runtime?: AgentRuntime;
+
+    private getRuntime(): AgentRuntime {
+        return this.runtime ??= new AgentRuntime({
+            messageService: this.service,
+            providers: this.providers,
+            defaultProvider: this.defaultProvider,
+            registry: this.registry,
+            agents: this.agents,
+            nativeAgents: this.nativeAgents,
+            kb: this.kb,
+            apiKey: OPENAI_API_KEY,
+        });
+    }
 
     constructor(messsageService: MessageService, providers: Map<LLMProvider, ILLM>, defaultProvider: LLMProvider, agents?: AgentService, nativeAgents?: NativeAgentService, kb?: KnowledgeBase) {
         super("/session", messsageService)
@@ -110,6 +140,20 @@ export class ChatMessages extends BaseRouter<MessageService> {
             return res.status(200).json(sessions);
         }));
 
+        // Paged chat list (Search page → "All chats", infinite scroll).
+        // ?limit=30&cursor=<nextCursor from the previous page>
+        this.router.get("/sessions", this.asyncHandler(async (req, res) => {
+            const limit = Math.min(SESSIONS_PAGE_MAX, Math.max(1, Number(req.query.limit) || SESSIONS_PAGE_DEFAULT));
+            let after: { ts: string; id: string } | undefined;
+            if (typeof req.query.cursor === "string" && req.query.cursor) {
+                const decoded = decodeCursor(req.query.cursor);
+                if (!decoded) return res.status(400).json({ message: "Invalid page cursor" });
+                after = decoded;
+            }
+            const page = await this.service.getUserSessionsPage(req.user!.sub, limit, after);
+            return res.status(200).json({ sessions: page.sessions, nextCursor: page.next ? encodeCursor(page.next) : null });
+        }));
+
 
 
         // Pin (favourite) or unpin a chat: { pinned: true | false }.
@@ -149,74 +193,36 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
 
         this.router.post("/chat_stream", this.asyncHandler(async (req, res) => {
-            const { llmMessage: rawMessage, currentSessionId, provider, model: requestedModel, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: string, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
-            let model = requestedModel;
-            if (!currentSessionId) {
-                throw new InvalidSession()
-            }
-            // Never read or append to another user's conversation.
-            if (!(await this.service.isSessionValid(String(currentSessionId), req.user!.sub))) {
-                throw new SessionValidationError();
-            }
+            const { llmMessage, currentSessionId, provider, model, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: string, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
+            // Session check, attachments, agent and model choice all happen in
+            // the runtime; a bad request is rejected here (400/404) before any
+            // streaming starts.
+            const prepared = await this.getRuntime().prepare({
+                channel: "web",
+                userId: req.user!.sub,
+                sessionId: currentSessionId ? String(currentSessionId) : "",
+                input: llmMessage,
+                provider,
+                model,
+                strictModel: true,
+                agentId: typeof agentId === "string" ? agentId : undefined,
+                nativeAgentId: typeof nativeAgentId === "string" ? nativeAgentId : undefined,
+            });
             void this.billing?.rememberUser(req.user!.sub, req.user!.email);
-            // Attached Word/Excel/PowerPoint/text files: include their extracted text.
-            const llmMessage = this.kb && rawMessage ? await withAttachmentText(rawMessage, req.user!.sub, this.kb) : rawMessage;
-            // Only models configured for the server, or on the user's own key —
-            // the client can't pick an arbitrary (possibly expensive) model.
-            let llm: ILLM;
-            if (this.registry) {
-                const resolved = await this.registry.resolve(req.user!.sub, provider, model, true).catch((err) => {
-                    throw new ValidationError(err instanceof Error ? err.message : String(err));
-                });
-                llm = resolved.llm;
-                model = resolved.model;
-            } else {
-                const found = this.providers.get((provider ?? this.defaultProvider) as LLMProvider);
-                if (!found) throw new ValidationError(`LLM provider "${provider}" is not available`);
-                if (model && !(found.getModels?.() ?? [found.getModel()]).includes(model)) {
-                    throw new ValidationError(`Model "${model}" is not available for ${found.getProvider()}`);
-                }
-                llm = found;
-            }
 
-            // A chat that belongs to an agent (or the first message of a new
-            // agent chat) runs with that agent's model, instructions and tools.
-            let run: ChatRunOptions | undefined;
-            // A chat with a provider-native agent runs on Claude Managed Agents /
-            // the OpenAI Agents API instead of this server's own loop.
-            const native = this.nativeAgents
-                ? await this.nativeAgents.agentForSession(String(currentSessionId), req.user!.sub, typeof nativeAgentId === "string" ? nativeAgentId : undefined)
-                    .catch((err) => { if (err?.status === 409) return { blocked: String(err.message) } as const; throw err; })
-                : null;
-            if (native && "blocked" in native) {
-                res.write(`event: error\ndata: ${JSON.stringify({ type: "error", message: native.blocked })}\n\n`);
+            res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("X-Accel-Buffering", "no"); // don't let a proxy buffer the stream
+            if ("blocked" in prepared) {
+                res.write(`event: error\ndata: ${JSON.stringify({ type: "error", message: prepared.blocked })}\n\n`);
                 return res.end();
             }
-            if (native) {
-                llm = this.nativeAgents!.llmFor(native.agent, native.remoteSessionId);
-                model = native.agent.model;
-            } else if (this.agents) {
-                const agent = await this.agents.agentForSession(String(currentSessionId), req.user!.sub, agentId);
-                if (agent) {
-                    const resolved = await this.agents.resolveLLM(agent);
-                    llm = resolved.llm;
-                    model = resolved.model;
-                    run = await this.agents.buildRun(agent);
-                }
-            }
-            const abortController= new AbortController();
-            // FIX — this used to listen on req.on("close"), which fires as
-            // soon as the REQUEST body finishes being read (which Express
-            // does almost instantly for a small JSON payload), not when the
-            // client actually disconnects. That meant abortController.abort()
-            // was firing within milliseconds of every single request, well
-            // before chatStream() ever got to call OpenAI — the user message
-            // would get persisted (that happens before the abort check) and
-            // then nothing else would ever run, which is why every request
-            // silently produced no reply at all.
-            // res.on("close") fires when the underlying connection actually
-            // closes; guarding on res.writableEnded stops it from firing a
-            // false "abort" after we've already finished the response normally.
+
+            const abortController = new AbortController();
+            // res "close" fires when the connection really closes (the user
+            // pressed Stop or left). req "close" fires as soon as the request
+            // body is read, which would abort every turn instantly.
+            // writableEnded guards against a false abort after a normal finish.
             res.on("close", () => {
                 if (!res.writableEnded) {
                     abortController.abort();
@@ -248,7 +254,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 "browser_screenshot",
             ]);
 
-            for await (const chunk of llm.chatStream([llmMessage], req.user!.sub, currentSessionId,OPENAI_API_KEY,abortController.signal,model,run)) {
+            for await (const chunk of prepared.stream(abortController.signal)) {
                 // NEW — this used to be a switch with one hardcoded case per
                 // event type. Every type the provider yields that wasn't
                 // listed there (mcp_*, sources, cancelled, and now the new

@@ -1,6 +1,7 @@
 import { AgentRepository, AgentScheduleRow } from "../../repository/agent_repository";
 import { AgentService } from "./agent_service";
 import { computeNextRun } from "./schedule_time";
+import { AgentRuntime } from "../../core/runtime";
 
 const TICK_MS = 30_000;
 const RUN_TIMEOUT_MS = 5 * 60_000;
@@ -16,6 +17,9 @@ type Notifier = (userId: string, text: string) => Promise<boolean>;
 export class AgentScheduler {
     private timer: NodeJS.Timeout | null = null;
     private running = new Set<string>();
+    // When set, runs go through the shared runtime (queued behind any chat
+    // turn in the same session); otherwise straight through AgentService.
+    private runtime?: AgentRuntime;
 
     constructor(
         private repo: AgentRepository,
@@ -29,6 +33,10 @@ export class AgentScheduler {
         this.timer.unref();
         void this.tick();
         console.log("[agents] scheduler started");
+    }
+
+    useRuntime(runtime: AgentRuntime): void {
+        this.runtime = runtime;
     }
 
     stop(): void {
@@ -67,7 +75,18 @@ export class AgentScheduler {
             runId = await this.repo.startRun(agent.id, s.id, sessionId);
             await this.repo.setScheduleStatus(s.id, "running");
 
-            const { text, error } = await this.agents.runOnce(agent, s.user_id, sessionId, s.prompt, AbortSignal.timeout(RUN_TIMEOUT_MS));
+            const signal = AbortSignal.timeout(RUN_TIMEOUT_MS);
+            const { text, error } = this.runtime
+                ? await this.runtime.runToText({
+                    channel: "schedule",
+                    userId: s.user_id,
+                    sessionId,
+                    input: { type: "message", role: "user", content: [{ type: "text", text: s.prompt }] },
+                }, signal).then((r) => ({
+                    text: r.text.trim(),
+                    error: r.error ?? (r.cancelled ? "The run took too long and was stopped." : null),
+                }))
+                : await this.agents.runOnce(agent, s.user_id, sessionId, s.prompt, signal);
             const ok = !!text && !error;
             await this.repo.finishRun(runId, ok ? "succeeded" : "failed", text.slice(0, OUTPUT_PREVIEW_CHARS) || null, error);
             await this.repo.setScheduleStatus(s.id, ok ? "succeeded" : "failed");

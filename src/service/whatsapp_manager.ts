@@ -81,6 +81,14 @@ export class WhatsAppManager {
         this.channel?.setSelfChat(s.selfChat);
     }
 
+    // For ChannelControl: null when WhatsApp isn't running in this process.
+    snapshot() {
+        const bridge = this._bridge;
+        if (!bridge) return null;
+        const s = bridge.status() as { state: string; botNumber?: string; qr?: string };
+        return { state: s.state, botNumber: s.botNumber, qr: s.state === "awaiting_qr" ? s.qr : undefined, selfChat: bridge.selfChatMode() };
+    }
+
     status() {
         return {
             hosted: this.deps.canHost,

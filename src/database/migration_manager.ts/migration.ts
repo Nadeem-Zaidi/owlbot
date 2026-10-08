@@ -665,6 +665,127 @@ export const migration_20261009100000: Migration = {
 };
 
 
+export const migration_20261010100000: Migration = {
+  version: "20261010100000",
+  description: "Context engine: running summary of each long chat",
+  up: [
+    // One row per session: a summary of its stored messages [0, upto_index).
+    `CREATE TABLE IF NOT EXISTS session_summaries (
+      session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+      summary     TEXT NOT NULL,
+      upto_index  INTEGER NOT NULL CHECK (upto_index >= 0),
+      model       TEXT,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS session_summaries`,
+  ]
+};
+
+
+export const migration_20261011100000: Migration = {
+  version: "20261011100000",
+  description: "Long-term memory: facts the assistant remembers about each user",
+  up: [
+    `CREATE TABLE IF NOT EXISTS user_memories (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      content     TEXT NOT NULL CHECK (char_length(content) BETWEEN 1 AND 500),
+      -- active: recalled in every chat; proposed: waiting for the user's OK ("Ask me first")
+      status      TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'proposed')),
+      -- chat: saved by the assistant; user: typed on the Memory page
+      source      TEXT NOT NULL DEFAULT 'chat' CHECK (source IN ('chat', 'user')),
+      session_id  TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_user_memories_user ON user_memories(user_id, status, updated_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS user_memory_settings (
+      user_id     TEXT PRIMARY KEY,
+      mode        TEXT NOT NULL DEFAULT 'auto' CHECK (mode IN ('auto', 'review', 'off')),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS user_memory_settings`,
+    `DROP TABLE IF EXISTS user_memories`,
+  ]
+};
+
+
+export const migration_20261012100000: Migration = {
+  version: "20261012100000",
+  description: "Chat channels (Telegram, …): linked chats and one-time link codes",
+  up: [
+    // A chat on a messaging app linked to a web account (WhatsApp keeps its own tables).
+    `CREATE TABLE IF NOT EXISTS channel_links (
+      channel            TEXT NOT NULL,
+      chat_id            TEXT NOT NULL,
+      user_id            TEXT NOT NULL,
+      display_name       TEXT,
+      active_session_id  TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      provider           TEXT,
+      model              TEXT,
+      linked_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (channel, chat_id),
+      UNIQUE (channel, user_id)
+    )`,
+    `CREATE TABLE IF NOT EXISTS channel_link_codes (
+      code        TEXT PRIMARY KEY,
+      channel     TEXT NOT NULL,
+      user_id     TEXT NOT NULL,
+      session_id  TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      used_at     TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_channel_link_codes_user ON channel_link_codes(channel, user_id)`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS channel_link_codes`,
+    `DROP TABLE IF EXISTS channel_links`,
+  ]
+};
+
+
+export const migration_20261013100000: Migration = {
+  version: "20261013100000",
+  description: "Skills (reusable instruction packs) and workflow flows (branches, conditions, approvals)",
+  up: [
+    // A user's skill library. Only name + description go into each request;
+    // the content is loaded on demand (load_skill tool).
+    `CREATE TABLE IF NOT EXISTS skills (
+      id           TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL,
+      name         TEXT NOT NULL CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,63}$'),
+      description  TEXT NOT NULL,
+      content      TEXT NOT NULL,
+      enabled      BOOLEAN NOT NULL DEFAULT true,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (user_id, name)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_skills_user ON skills(user_id, updated_at DESC)`,
+    // Which skills an agent may use: all of the owner's, a chosen list, or none.
+    `ALTER TABLE agents ADD COLUMN IF NOT EXISTS skill_mode TEXT NOT NULL DEFAULT 'all' CHECK (skill_mode IN ('all', 'selected', 'none'))`,
+    `ALTER TABLE agents ADD COLUMN IF NOT EXISTS skill_ids JSONB NOT NULL DEFAULT '[]'`,
+    // Workflows: a graph of nodes (pipelines without it are linear "steps").
+    `ALTER TABLE pipelines ADD COLUMN IF NOT EXISTS flow JSONB`,
+    // Where a paused run (waiting for approval) continues from.
+    `ALTER TABLE pipeline_runs ADD COLUMN IF NOT EXISTS state JSONB`,
+    `CREATE INDEX IF NOT EXISTS idx_pipeline_runs_waiting ON pipeline_runs(user_id) WHERE status = 'waiting'`,
+  ],
+  down: [
+    `DROP INDEX IF EXISTS idx_pipeline_runs_waiting`,
+    `ALTER TABLE pipeline_runs DROP COLUMN IF EXISTS state`,
+    `ALTER TABLE pipelines DROP COLUMN IF EXISTS flow`,
+    `ALTER TABLE agents DROP COLUMN IF EXISTS skill_ids`,
+    `ALTER TABLE agents DROP COLUMN IF EXISTS skill_mode`,
+    `DROP TABLE IF EXISTS skills`,
+  ]
+};
+
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -683,5 +804,9 @@ export const migrations: Migration[] = [
   migration_20261005150000,
   migration_20261007100000,
   migration_20261008100000,
-  migration_20261009100000
+  migration_20261009100000,
+  migration_20261010100000,
+  migration_20261011100000,
+  migration_20261012100000,
+  migration_20261013100000
 ];

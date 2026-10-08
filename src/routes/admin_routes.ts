@@ -1,7 +1,9 @@
 import { NextFunction, Request, Response, Router } from "express";
 import { isOwner, ownerEmails } from "../service/agents/owner";
-import { SettingsService } from "../service/settings_service";
+import { SettingsService, TelegramVerifier } from "../service/settings_service";
 import { WhatsAppManager } from "../service/whatsapp_manager";
+import { TelegramManager } from "../service/telegram_manager";
+import { ChannelControl } from "../channels/core/channel_control";
 
 type Handler = (req: Request, res: Response) => Promise<unknown>;
 
@@ -21,7 +23,13 @@ const requireOwner = (req: Request, res: Response, next: NextFunction) => {
 };
 
 // /api/admin — server settings for the owner (behind Firebase auth).
-export function createAdminRouter(settings: SettingsService, whatsapp: WhatsAppManager): Router {
+export function createAdminRouter(
+    settings: SettingsService,
+    whatsapp: WhatsAppManager,
+    telegram?: { manager: TelegramManager; verify: TelegramVerifier },
+    // Live state of channels running in another process (ROLE=jobs).
+    controls?: { whatsapp?: ChannelControl; telegram?: ChannelControl },
+): Router {
     const r = Router();
 
     // Lets the web app decide whether to show "Server settings".
@@ -29,7 +37,7 @@ export function createAdminRouter(settings: SettingsService, whatsapp: WhatsAppM
 
     const whatsappView = async () => {
         const s = await settings.whatsapp(true);
-        const runtime = whatsapp.status();
+        const runtime = await liveStatus(whatsapp.status(), controls?.whatsapp);
         return {
             settings: { enabled: s.enabled, selfChat: s.selfChat, adminEmails: s.adminEmails },
             updatedAt: s.updatedAt,
@@ -53,5 +61,30 @@ export function createAdminRouter(settings: SettingsService, whatsapp: WhatsAppM
         res.json(await whatsappView());
     }));
 
+    // ── Telegram bot ──
+    if (telegram) {
+        const telegramView = async () => {
+            const runtime = await liveStatus(telegram.manager.status(), controls?.telegram);
+            return {
+                settings: await settings.telegramView(),
+                runtime: { hostedHere: runtime.hosted, running: runtime.running, state: runtime.state },
+            };
+        };
+        r.get("/settings/telegram", requireOwner, h(async (_req, res) => res.json(await telegramView())));
+        // { enabled?, botToken? } — a new token is checked with Telegram first.
+        r.put("/settings/telegram", requireOwner, h(async (req, res) => {
+            const next = await settings.saveTelegram(req.body, req.user!.email ?? req.user!.sub, telegram.verify);
+            await telegram.manager.apply(next);
+            res.json(await telegramView());
+        }));
+    }
+
     return r;
+}
+
+// This process's view, or — when the channel runs elsewhere — its snapshot.
+async function liveStatus<T extends { hosted: boolean; running: boolean; state: string }>(local: T, control?: ChannelControl): Promise<T & { botNumber?: string }> {
+    if (local.running || !control) return local;
+    const snap = await control.status().catch(() => null);
+    return snap ? { ...local, running: true, state: snap.state, botNumber: snap.botNumber } : local;
 }

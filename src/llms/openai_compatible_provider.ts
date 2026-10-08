@@ -5,7 +5,7 @@ import { LLMConfig } from "../types/lmconfig";
 import { LLMTool } from "../tools/tool_registry";
 import { IDatabaseAdapter } from "../database/idatabaseadapter";
 import { MessageService } from "../service/message_service";
-import { windowHistory } from "./history_window";
+import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 import { assertPublicUrl } from "../service/agents/url_guard";
@@ -230,7 +230,13 @@ export class OpenAICompatibleProvider implements ILLM {
 
         await this.messageService.runTransaction(sessionId, messages);
         const stored = await this.messageService.loadMessages(sessionId);
-        const history = this.fromInput(windowHistory(stored));
+        // The context engine picks what part of the stored history is sent
+        // (recent messages + a summary of older ones); everything stays stored.
+        const context = await contextEngine().assemble(stored, {
+            sessionId, userId, skillScope: run?.skillScope, model: activeModel, summarize: (system, text) => this.summarizeText(system, text, activeModel),
+        });
+        for (const u of context.usage) yield usageIncrement(u.usage, u.model, "compaction");
+        const history = this.fromInput(context.messages);
         if (run?.systemPrompt) {
             if (history[0]?.role === "system") history[0] = { role: "system", content: `${run.systemPrompt}\n\n${history[0].content}` };
             else history.unshift({ role: "system", content: run.systemPrompt });
@@ -353,6 +359,20 @@ export class OpenAICompatibleProvider implements ILLM {
             }
         }
         yield errorChunk("error", "Stopped after too many tool calls in one answer.");
+    }
+
+    // One-shot completion for the context engine's summaries. Uses the chat's
+    // model: a user's key may only allow the models they listed.
+    private async summarizeText(system: string, text: string, model: string): Promise<{ text: string; usage?: TokenCounts; model?: string }> {
+        const res = await fetch(`${this.baseUrl}/chat/completions`, {
+            method: "POST",
+            headers: this.headers(),
+            body: JSON.stringify({ model, max_tokens: 1500, messages: [{ role: "system", content: system }, { role: "user", content: text }] }),
+            signal: AbortSignal.timeout(90_000),
+        });
+        if (!res.ok) throw new Error(`summary request failed (${res.status})`);
+        const json: any = await res.json();
+        return { text: String(json.choices?.[0]?.message?.content ?? ""), usage: json.usage ? toCounts(json.usage) : undefined, model: json.model ?? model };
     }
 
     private async generateTitle(transcript: string, model = this.config.model): Promise<{ title: string; usage?: TokenCounts }> {

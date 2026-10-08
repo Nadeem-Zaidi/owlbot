@@ -17,6 +17,10 @@ export class  MessageService{
         return this.messageRepository.rawDb();
     }
 
+    async getUserSessionsPage(userId: string, limit: number, after?: { ts: string; id: string }) {
+        return this.sessionRepository.getUserSessionsPage(userId, limit, after);
+    }
+
     async getUserSessions(userId:string):Promise<Session[]>{
         const userSessions=await this.sessionRepository.getUserSessions(userId)
         return userSessions;
@@ -38,7 +42,7 @@ export class  MessageService{
 
 
 
-    async createSession(userId:string, source:"web"|"whatsapp"|"pipeline"="web", title?:string):Promise<Session>{
+    async createSession(userId:string, source:"web"|"whatsapp"|"telegram"|"pipeline"="web", title?:string):Promise<Session>{
         const createdSession=await this.sessionRepository.createSession(userId, source, title);
         return createdSession;
     }

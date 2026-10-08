@@ -34,6 +34,9 @@ export type AgentRow = {
     document_keys: string[];
     starters: string[];
     instruction_files: InstructionFile[];
+    // Which of the owner's skills the agent may load.
+    skill_mode: "all" | "selected" | "none";
+    skill_ids: string[];
     created_at: Date;
     updated_at: Date;
 };
@@ -113,7 +116,9 @@ export type AgentRunRow = {
     finished_at: Date | null;
 };
 
-export type AgentInput = Pick<AgentRow, "name" | "icon" | "description" | "instructions" | "provider" | "model" | "builtin_tools" | "document_keys" | "starters" | "instruction_files">;
+export type AgentInput = Pick<AgentRow, "name" | "icon" | "description" | "instructions" | "provider" | "model" | "builtin_tools" | "document_keys" | "starters" | "instruction_files">
+    // Omitted (older clients) → unchanged on update, "all" on create.
+    & { skill_mode?: AgentRow["skill_mode"]; skill_ids?: string[] };
 export type FunctionInput = Pick<AgentFunctionRow, "name" | "description" | "method" | "url" | "parameters" | "headers" | "enabled">;
 export type ScheduleInput = Pick<AgentScheduleRow, "name" | "prompt" | "frequency" | "interval_hours" | "time_of_day" | "weekday" | "timezone" | "deliver_whatsapp" | "enabled">;
 
@@ -144,10 +149,10 @@ export class AgentRepository {
 
     async createAgent(userId: string, a: AgentInput): Promise<AgentRow> {
         const { rows } = await this.db.query<AgentRow>(
-            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
             [randomUUID(), userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
-             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files)]
+             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files), a.skill_mode ?? "all", json(a.skill_ids ?? [])]
         );
         return rows[0];
     }
@@ -155,10 +160,12 @@ export class AgentRepository {
     async updateAgent(id: string, userId: string, a: AgentInput): Promise<AgentRow | null> {
         const { rows } = await this.db.query<AgentRow>(
             `UPDATE agents SET name=$3, icon=$4, description=$5, instructions=$6, provider=$7, model=$8,
-                    builtin_tools=$9, document_keys=$10, starters=$11, instruction_files=$12, updated_at=now()
+                    builtin_tools=$9, document_keys=$10, starters=$11, instruction_files=$12,
+                    skill_mode=COALESCE($13, skill_mode), skill_ids=COALESCE($14::jsonb, skill_ids), updated_at=now()
              WHERE id=$1 AND user_id=$2 RETURNING *`,
             [id, userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
-             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files)]
+             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files),
+             a.skill_mode ?? null, a.skill_ids ? json(a.skill_ids) : null]
         );
         return rows[0] ?? null;
     }

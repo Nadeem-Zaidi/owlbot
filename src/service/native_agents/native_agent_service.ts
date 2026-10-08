@@ -5,6 +5,7 @@ import { UsageRepository } from "../../repository/usage_repository";
 import { EmbeddingProvider, createVectorSearchTool } from "../../tools/vector_tool";
 import { LLMMessage } from "../../types/llm_message";
 import { UsageTrackingLLM, usageIncrement } from "../../llms/usage_tracking";
+import { collectReply } from "../../core/runtime/collect";
 import { MessageService } from "../message_service";
 import { AgentError, AgentService, codeFunctionDto, functionDto } from "../agents/agent_service";
 import { assertPublicUrl } from "../agents/url_guard";
@@ -270,20 +271,10 @@ export class NativeAgentService {
     async runOnce(agent: NativeAgentRow, userId: string, sessionId: string, prompt: string, signal: AbortSignal): Promise<{ text: string; error: string | null }> {
         await this.requireActive(userId, agent);
         await this.deps.repo.attachSession(sessionId, userId, agent.id);
-        let text = "";
-        let error: string | null = null;
         const message = { type: "message", role: "user", content: [{ type: "text", text: prompt }] } as LLMMessage;
         // Nobody is watching a pipeline step, so browser approvals are cancelled.
-        for await (const chunk of this.llmFor(agent, null, false).chatStream([message], userId, sessionId, "", signal)) {
-            if (chunk.type === "message" && chunk.role === "assistant" && Array.isArray(chunk.content)) {
-                for (const part of chunk.content as any[]) if (part?.type === "text") text += part.text ?? "";
-            } else if (chunk.type === "error") {
-                error = (chunk as any).message ?? "Something went wrong";
-            } else if (chunk.type === "cancelled") {
-                error = "The step took too long and was stopped.";
-            }
-        }
-        return { text: text.trim(), error };
+        const r = await collectReply(this.llmFor(agent, null, false).chatStream([message], userId, sessionId, "", signal));
+        return { text: r.text.trim(), error: r.error ?? (r.cancelled ? "The step took too long and was stopped." : null) };
     }
 
     // An ILLM for one chat turn, so the chat route, usage tracking and history

@@ -11,7 +11,8 @@ export type UsageEntry = TokenCounts & {
     userId: string;
     sessionId?: string | null;
     agentId?: string | null;
-    kind: "chat" | "title" | "agent_draft";
+    // "compaction": summarizing older messages of a long chat (context engine).
+    kind: "chat" | "title" | "agent_draft" | "compaction";
     provider?: string | null;
     model?: string | null;
     requests?: number;
@@ -79,6 +80,7 @@ export class UsageRepository {
             this.db.query<Grouped & { source: string }>(
                 `SELECT CASE WHEN kind = 'agent_draft' THEN 'agent_builder'
                              WHEN source = 'whatsapp' THEN 'whatsapp'
+                             WHEN source = 'telegram' THEN 'telegram'
                              WHEN source = 'pipeline' THEN 'pipeline'
                              WHEN agent_id IS NOT NULL THEN 'agent'
                              ELSE 'chat' END AS source, ${SUMS}

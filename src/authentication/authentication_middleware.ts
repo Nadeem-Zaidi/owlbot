@@ -69,3 +69,10 @@ export const verifyToken = async (req: Request, res: Response, next: NextFunctio
 };
 
 const REQUIRE_VERIFIED_PHONE = process.env.REQUIRE_VERIFIED_PHONE !== "false";
+
+// Same rules as verifyToken, for the live-events WebSocket (no Express request).
+export async function verifySocketToken(token: string): Promise<{ uid: string }> {
+    const decoded = await firebaseAdmin.auth().verifyIdToken(token);
+    if (REQUIRE_VERIFIED_PHONE && !decoded.phone_number) throw new Error("phone not verified");
+    return { uid: decoded.uid };
+}

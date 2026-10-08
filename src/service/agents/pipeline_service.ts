@@ -4,6 +4,12 @@ import { NativeAgentRow } from "../../repository/native_agent_repository";
 import { MessageService } from "../message_service";
 import { NativeAgentService } from "../native_agents/native_agent_service";
 import { AgentError, AgentService } from "./agent_service";
+import { FlowRunner, FlowRunnerDeps } from "../../core/flows/flow_runner";
+import { FlowError, stepsToFlow, validateFlow } from "../../core/flows/flow_validate";
+import { Flow, FlowRunState, FlowTraceEntry } from "../../core/flows/flow_types";
+
+// Optional workflow features wired from main.ts (AI conditions, notifications).
+export type FlowOptions = Pick<FlowRunnerDeps, "askModel" | "notify" | "webAppUrl">;
 
 const MAX_STEPS = 10;
 const STEP_TIMEOUT_MS = 5 * 60_000;
@@ -28,10 +34,13 @@ export function renderInstruction(instruction: string, input: string, previous: 
     return usesPlaceholder ? filled : `${filled}\n\n---\nInput:\n${previous}`;
 }
 
-// Runs agents one after another: each step's output is the next step's input.
-// A step can be a regular agent or a provider agent (Claude / OpenAI).
+// Pipelines and workflows. A pipeline runs agents one after another (each
+// step's output is the next step's input); a workflow (a pipeline with a
+// `flow`) is a graph with conditions, approvals and notifications, run by
+// FlowRunner. A step can be a regular agent or a provider agent.
 export class PipelineService {
     private active = 0;
+    private flows: FlowRunner;
 
     constructor(
         private repo: PipelineRepository,
@@ -39,7 +48,10 @@ export class PipelineService {
         private agents: AgentService,
         private messageService: MessageService,
         private nativeAgents?: NativeAgentService,
-    ) {}
+        flowOptions: FlowOptions = {},
+    ) {
+        this.flows = new FlowRunner({ repo, agentRepo, agents, messageService, nativeAgents, ...flowOptions });
+    }
 
     // The provider agent for a step, or null if it was deleted.
     private async nativeAgent(userId: string, id: string): Promise<NativeAgentRow | null> {
@@ -58,7 +70,8 @@ export class PipelineService {
     async get(userId: string, id: string) {
         const p = await this.repo.get(id, userId);
         if (!p) throw new AgentError("Pipeline not found", 404);
-        return { ...p, runs: await this.repo.listRuns(id, userId, 15) };
+        // Older pipelines open in the workflow editor as a straight line.
+        return { ...p, flow: p.flow ?? stepsToFlow(p.steps), is_workflow: !!p.flow, runs: await this.repo.listRuns(id, userId, 15) };
     }
 
     async create(userId: string, body: any) {
@@ -83,6 +96,14 @@ export class PipelineService {
     private async validate(userId: string, b: any): Promise<PipelineInput> {
         const name = str(b?.name, 80, "Name", true);
         const description = str(b?.description, 300, "Description");
+        if (b?.flow) {
+            const flow = await validateFlow(b.flow, async (kind, id) =>
+                kind === "native" ? !!(await this.nativeAgent(userId, id)) : !!(await this.agentRepo.getAgent(id, userId)),
+            ).catch((err) => { throw err instanceof FlowError ? new AgentError(err.message, err.status) : err; });
+            // `steps` lists the agent steps (for the gallery's "N steps").
+            const steps = flow.nodes.flatMap((n) => (n.type === "agent" ? [{ kind: n.agent_kind, agent_id: n.agent_id, instruction: n.instruction }] : []));
+            return { name, description, steps, flow };
+        }
         const raw = Array.isArray(b?.steps) ? b.steps : [];
         if (raw.length === 0) throw new AgentError("Add at least one step");
         if (raw.length > MAX_STEPS) throw new AgentError(`A pipeline can have at most ${MAX_STEPS} steps`);
@@ -105,6 +126,7 @@ export class PipelineService {
         if (!pipeline) throw new AgentError("Pipeline not found", 404);
         if (this.active >= MAX_PARALLEL_RUNS) throw new AgentError("Too many pipelines are running — try again in a moment", 429);
         const input = str(rawInput, MAX_INPUT_CHARS, "Input");
+        if (pipeline.flow) return this.startFlow(userId, pipeline.id, pipeline.name, pipeline.flow, input);
 
         const steps: PipelineRunStep[] = [];
         for (const [i, s] of pipeline.steps.entries()) {
@@ -126,6 +148,64 @@ export class PipelineService {
         this.active++;
         void this.execute(run.id, userId, pipeline.name, pipeline.steps, input, steps).finally(() => this.active--);
         return run;
+    }
+
+    // ── workflows ──
+    private async startFlow(userId: string, pipelineId: string, name: string, flow: Flow, input: string) {
+        // Provider agents must be usable before anything runs.
+        for (const n of flow.nodes) {
+            if (n.type !== "agent" || n.agent_kind !== "native") continue;
+            const agent = await this.nativeAgent(userId, n.agent_id);
+            if (agent) await this.nativeAgents!.requireActive(userId, agent).catch((err) => { throw new AgentError(`"${n.label ?? n.id}": ${err.message}`, 409); });
+        }
+        const state = this.flows.initialState(input, flow);
+        const run = await this.repo.startRun(pipelineId, userId, input, [], state);
+        this.runFlowInBackground(run.id, userId, pipelineId, name, flow, state, []);
+        return run;
+    }
+
+    private runFlowInBackground(runId: number, userId: string, pipelineId: string, name: string, flow: Flow, state: FlowRunState, trace: FlowTraceEntry[]) {
+        this.active++;
+        void this.flows.run(runId, userId, pipelineId, name, flow, state, trace)
+            .catch((err) => console.error(`[workflows] run ${runId} crashed:`, err))
+            .finally(() => this.active--);
+    }
+
+    // Approve or reject a run waiting at an approval step. Works on any
+    // server: the run is claimed atomically, then continues here.
+    async decide(userId: string, runId: number, body: any) {
+        if (typeof body?.approved !== "boolean") throw new AgentError("approved must be true or false");
+        const comment = str(body?.comment, 500, "Comment");
+        const run = await this.repo.claimWaiting(runId, userId);
+        if (!run) throw new AgentError("This run isn't waiting for approval (already decided, or cancelled)", 409);
+        const pipeline = await this.repo.get(run.pipeline_id, userId);
+        const flow = pipeline?.flow;
+        const state = run.state;
+        const trace = (run.steps ?? []) as unknown as FlowTraceEntry[];
+        const waitingAt = state?.current ? flow?.nodes.find((n) => n.id === state.current) : undefined;
+        if (!pipeline || !flow || !state || waitingAt?.type !== "approval") {
+            await this.repo.endRun(runId, "failed", trace, null, "The workflow was changed or deleted while waiting");
+            throw new AgentError("The workflow was changed or deleted while waiting", 409);
+        }
+        const by = typeof body?.by === "string" ? body.by.slice(0, 120) : userId;
+        const continues = this.flows.applyDecision(flow, state, trace, body.approved, by, comment);
+        if (!continues) {
+            await this.repo.endRun(runId, "rejected", trace, null, comment ? `Rejected: ${comment}` : "Rejected", state);
+            return { status: "rejected" };
+        }
+        await this.repo.saveFlowRun(runId, trace, state);
+        this.runFlowInBackground(runId, userId, pipeline.id, pipeline.name, flow, state, trace);
+        return { status: "running" };
+    }
+
+    async cancel(userId: string, runId: number) {
+        const run = await this.repo.cancelRun(runId, userId);
+        if (!run) throw new AgentError("This run has already finished", 409);
+        return { status: "cancelled" };
+    }
+
+    approvals(userId: string) {
+        return this.repo.listWaiting(userId);
     }
 
     private async execute(runId: number, userId: string, pipelineName: string, plan: PipelineStep[], input: string, steps: PipelineRunStep[]) {
