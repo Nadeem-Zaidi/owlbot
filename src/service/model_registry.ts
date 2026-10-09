@@ -13,6 +13,10 @@ import { LLMConfig } from "../types/lmconfig";
 import { LLMMessage } from "../types/llm_message";
 import { decryptSecret, encryptSecret } from "./agents/secrets";
 import { assertPublicUrl } from "./agents/url_guard";
+import type { MarketplaceService } from "../core/marketplace/marketplace_service";
+import { WalletLLM } from "../core/marketplace/wallet_llm";
+import { FailoverLLM } from "../core/marketplace/failover_llm";
+import type { Route } from "../core/marketplace/router";
 
 // Every place that runs a model (web chat, agents, WhatsApp) asks this
 // registry for it. It merges the server's own providers (.env keys) with
@@ -102,7 +106,11 @@ type Deps = {
     messageService: MessageService;
     tools: LLMTool;
     fileStore?: IFileStore;
+    // The model marketplace (OpenRouter models paid from the user's credits).
+    marketplace?: MarketplaceService;
 };
+
+export const MARKET_PROVIDER = "market";
 
 export class ModelRegistry {
     private cache = new Map<string, { stamp: number; llm: ILLM }>();
@@ -135,7 +143,60 @@ export class ModelRegistry {
             defaultModel: k.default_model && k.models.includes(k.default_model) ? k.default_model : k.models[0],
             models: k.models.map((m) => ({ id: m, label: modelLabel(m) })),
         }));
-        return { providers: [...platform, ...own], defaultProvider: this.deps.defaultProvider };
+        const market = await this.marketOption(userId).catch(() => null);
+        return { providers: [...platform, ...own, ...(market ? [market] : [])], defaultProvider: this.deps.defaultProvider };
+    }
+
+    // The user's marketplace models (added from the Models page), if any.
+    private async marketOption(userId: string): Promise<ProviderOption | null> {
+        const m = this.deps.marketplace;
+        if (!m?.enabled) return null;
+        const ids = await m.favorites(userId);
+        if (!ids.length) return null;
+        const models = await Promise.all(ids.map(async (id) => ({ id, label: (await m.catalog.get(id).catch(() => null))?.name ?? id })));
+        return { id: MARKET_PROVIDER, label: "Marketplace · credits", kind: MARKET_PROVIDER, byok: false, defaultModel: ids[0], models };
+    }
+
+    // A marketplace model for a chat turn, billed to the user's credits.
+    private async resolveMarket(userId: string, model: string | null | undefined, strict: boolean): Promise<Resolved | null> {
+        const m = this.deps.marketplace;
+        if (!m?.enabled) {
+            if (strict) throw new RegistryError("The model marketplace isn't available on this server", 404);
+            return null;
+        }
+        const known = async (id: string | null | undefined) => !!id && !!(await m.catalog.get(id).catch(() => null));
+        let chosen: string | null = model ?? null;
+        if (chosen && !(await known(chosen))) {
+            if (strict) throw new RegistryError(`Model "${chosen}" isn't in the marketplace`);
+            chosen = null;
+        }
+        // No (valid) model given: the user's first marketplace model still offered.
+        if (!chosen) {
+            for (const id of await m.favorites(userId)) if (await known(id)) { chosen = id; break; }
+        }
+        if (!chosen) {
+            if (strict) throw new RegistryError("Pick a marketplace model on the Models page first");
+            return null;
+        }
+        const modelId = chosen;
+        const { messageService, tools } = this.deps;
+        // One provider per route: Claude through the native Claude provider,
+        // everything else (OpenAI, Google, DeepInfra, Groq, OpenRouter…) OpenAI-compatible.
+        const build = (route: Route): ILLM => {
+            const config: LLMConfig = {
+                model: route.upstreamModel, models: [route.upstreamModel],
+                temperature: Number(process.env.LLM_TEMPERATURE ?? 0.7),
+                maxTokens: route.kind === "anthropic" ? Number(process.env.ANTHROPIC_MAX_TOKENS ?? 64000) : Number(process.env.BYOK_MAX_TOKENS ?? 8192),
+            };
+            const inner = route.kind === "anthropic"
+                ? new AnthropicProvider(route.apiKey, config, messageService, tools)
+                : new OpenAICompatibleProvider(route.apiKey, route.baseUrl, config, messageService, tools, "marketplace");
+            return new WalletLLM(inner, m, route, modelId);
+        };
+        const failover = new FailoverLLM(modelId, (sessionId) => m.routes(modelId, sessionId), build, m.router);
+        // Paid from credits, so it doesn't count toward the plan's token quota.
+        const llm = new UsageTrackingLLM(failover, this.deps.usage, { keyId: null });
+        return { llm, provider: MARKET_PROVIDER, model: chosen, byok: true };
     }
 
     // ── picking a model for a request ──
@@ -143,6 +204,12 @@ export class ModelRegistry {
     // back to the server default (stored choices that went stale, e.g. a key
     // the user deleted).
     async resolve(userId: string, providerId?: string | null, model?: string | null, strict = false): Promise<Resolved> {
+        if (providerId === MARKET_PROVIDER) {
+            const market = await this.resolveMarket(userId, model, strict);
+            if (market) return market;
+            providerId = null;
+            model = null;
+        }
         if (providerId && providerId.startsWith(KEY_PREFIX)) {
             const key = await this.deps.repo.get(userId, providerId.slice(KEY_PREFIX.length));
             if (key && key.enabled && key.models.length) {

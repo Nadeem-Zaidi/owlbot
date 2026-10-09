@@ -13,7 +13,10 @@ export const ARTIFACT_TOOL_NAMES = ["create_artifact", "update_artifact"];
 const HTML_GUIDE =
     "For kind \"html\": write ONE complete, self-contained HTML document (<!doctype html>, <style> inline, no external CSS files). " +
     "It renders in a sandboxed frame that blocks network requests, except scripts from https://cdn.jsdelivr.net, https://cdnjs.cloudflare.com and https://unpkg.com " +
-    "(e.g. Chart.js: <script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script>). Embed all data inline. " +
+    "(e.g. Chart.js: <script src=\"https://cdn.jsdelivr.net/npm/chart.js@4.4.1\"></script>). Embed all data inline. " +
+    "Draw every chart with Chart.js on a <canvas> inside a container with a fixed height — never build bars or charts out of divs, " +
+    "and never put long text inside bars; labels go on the axes and in tooltips. Use a clean sans-serif font, generous spacing, " +
+    "and format numbers consistently (thousand separators, the right currency symbol). " +
     "Make it responsive, readable and polished: clear headings, summary first, tables and charts where they help.";
 
 const receipt = (a: { id: string; title: string; kind: string; current_version: number }) => ({
@@ -46,7 +49,8 @@ export function createArtifactTools(repo: ArtifactRepository): ToolDefinition[] 
                 "Shows a document in a side panel next to the chat, where the user can read, copy and download it. " +
                 "Use it for substantial standalone content the user asked for — a report, document, article, plan, " +
                 "web page, dashboard or HTML visualisation (roughly 20+ lines). Don't use it for short answers or quick snippets. " +
-                "kind \"markdown\" for text documents; \"html\" for pages, dashboards and reports with charts or styling. " + HTML_GUIDE,
+                "kind \"markdown\" for text documents; \"html\" for pages, dashboards and reports with charts or styling. " +
+                "To just visualise some data as one chart, use show_chart instead — it renders inline and cleanly. " + HTML_GUIDE,
             parameters: {
                 type: "object",
                 properties: {

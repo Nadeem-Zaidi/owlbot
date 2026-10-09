@@ -88,3 +88,47 @@ export function runPython(code: string, args: Record<string, unknown>, secrets: 
         );
     });
 }
+
+// ── Word / Excel files (DocumentBuilder) ──
+const documentBuilder = new proto.DocumentBuilder(
+    GRPC_SERVER_ADDRESS,
+    grpc.credentials.createInsecure(),
+    {
+        "grpc.max_send_message_length": 20 * 1024 * 1024,
+        "grpc.max_receive_message_length": 40 * 1024 * 1024,
+    }
+);
+
+// A problem with the content (e.g. "add at least one sheet") — shown to the
+// assistant so it can fix its request.
+export class DocumentSpecError extends Error {}
+
+export function buildDocument(kind: "word" | "excel", spec: unknown, style: unknown, logo?: Buffer | null): Promise<Buffer> {
+    const method = kind === "word" ? "BuildWord" : "BuildExcel";
+    return new Promise((resolve, reject) => {
+        documentBuilder[method](
+            { spec_json: JSON.stringify(spec ?? {}), style_json: JSON.stringify(style ?? {}), logo: logo ?? Buffer.alloc(0) },
+            { deadline: Date.now() + 60_000 },
+            (err: grpc.ServiceError | null, response: any) => {
+                if (err) return reject(new Error(`The document service isn't reachable (${err.code === grpc.status.UNAVAILABLE ? "is the Python service running?" : err.details || err.message})`));
+                if (!response.ok) return reject(new DocumentSpecError(response.error || "The document couldn't be built"));
+                resolve(Buffer.from(response.content));
+            }
+        );
+    });
+}
+
+// The viewer's preview of a generated file: JSON bytes — {kind:"word", html} or {kind:"excel", sheets}.
+export function previewDocument(kind: "word" | "excel", content: Buffer): Promise<Buffer> {
+    return new Promise((resolve, reject) => {
+        documentBuilder.PreviewDocument(
+            { kind, content },
+            { deadline: Date.now() + 60_000 },
+            (err: grpc.ServiceError | null, response: any) => {
+                if (err) return reject(new Error(`The document service isn't reachable (${err.code === grpc.status.UNAVAILABLE ? "is the Python service running?" : err.details || err.message})`));
+                if (!response.ok) return reject(new DocumentSpecError(response.error || "The preview couldn't be made"));
+                resolve(Buffer.from(response.content));
+            }
+        );
+    });
+}

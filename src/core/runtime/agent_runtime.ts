@@ -89,10 +89,10 @@ export class AgentRuntime {
     async runToText(req: RunRequest, signal: AbortSignal): Promise<CollectedReply> {
         try {
             const prepared = await this.prepare(req);
-            if ("blocked" in prepared) return { text: "", sources: [], error: prepared.blocked, cancelled: false };
+            if ("blocked" in prepared) return { text: "", sources: [], error: prepared.blocked, cancelled: false, files: [] };
             return await collectReply(prepared.stream(signal));
         } catch (err) {
-            return { text: "", sources: [], error: err instanceof Error ? err.message : String(err), cancelled: false };
+            return { text: "", sources: [], error: err instanceof Error ? err.message : String(err), cancelled: false, files: [] };
         }
     }
 

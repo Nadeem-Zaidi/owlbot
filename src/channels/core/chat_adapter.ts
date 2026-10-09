@@ -41,8 +41,12 @@ export interface ChatAdapter {
     // Sends one piece produced by render().
     send(chatId: string, text: string): Promise<void>;
     setTyping?(chatId: string, typing: boolean): Promise<void>;
+    // Sends a file (e.g. a generated Word/Excel document) as an attachment.
+    sendFile?(chatId: string, file: OutboundFile): Promise<void>;
     status(): AdapterStatus;
 }
+
+export type OutboundFile = { buffer: Buffer; filename: string; mime: string; caption?: string };
 
 // Which web account a chat on the app belongs to.
 export type ChannelLink = {

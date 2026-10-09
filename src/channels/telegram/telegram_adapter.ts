@@ -1,4 +1,4 @@
-import { AdapterState, ChatAdapter, InboundMedia, InboundMessage } from "../core/chat_adapter";
+import { AdapterState, ChatAdapter, InboundMedia, InboundMessage, OutboundFile } from "../core/chat_adapter";
 import { renderTelegram, stripHtml } from "./telegram_format";
 
 // Telegram through the Bot API, with long polling (getUpdates): no public
@@ -81,6 +81,17 @@ export class TelegramAdapter implements ChatAdapter {
             }
             throw err;
         }
+    }
+
+    // sendDocument (multipart). Bots can send files up to 50 MB.
+    async sendFile(chatId: string, file: OutboundFile): Promise<void> {
+        const form = new FormData();
+        form.append("chat_id", chatId);
+        form.append("document", new Blob([new Uint8Array(file.buffer)], { type: file.mime }), file.filename);
+        if (file.caption) form.append("caption", file.caption.slice(0, 1000));
+        const res = await fetch(`${this.apiBase}/bot${this.token}/sendDocument`, { method: "POST", body: form, signal: AbortSignal.timeout(120_000) });
+        const json: any = await res.json().catch(() => ({}));
+        if (!json.ok) throw new TelegramError(json.error_code ?? res.status, String(json.description ?? `HTTP ${res.status}`));
     }
 
     async setTyping(chatId: string, typing: boolean): Promise<void> {

@@ -60,6 +60,7 @@ import { WhatsAppManager } from "./service/whatsapp_manager";
 import { createAdminRouter } from "./routes/admin_routes";
 import { ArtifactRepository } from "./repository/artifact_repository";
 import { createArtifactTools } from "./tools/artifact_tools";
+import { createChartTools } from "./tools/chart_tools";
 import { createArtifactRouter } from "./routes/artifact_routes";
 import { AgentRuntime } from "./core/runtime";
 import { contextEngine, setContextEngine, SummaryContextEngine } from "./core/context";
@@ -68,6 +69,10 @@ import { MemoryRepository } from "./repository/memory_repository";
 import { createMemoryRouter } from "./routes/memory_routes";
 import { createSkillTools, SkillIndexEngine, SkillService } from "./core/skills";
 import { SkillRepository } from "./repository/skill_repository";
+import { DocumentService } from "./core/documents/document_service";
+import { createDocumentTools } from "./core/documents/document_tools";
+import { DocumentRepository } from "./repository/document_repository";
+import { createDocumentRouter } from "./routes/document_routes";
 import { createSkillRouter } from "./routes/skill_routes";
 import { ChatBridge } from "./channels/core/chat_bridge";
 import { AgentDirectory } from "./channels/core/chat_adapter";
@@ -76,6 +81,11 @@ import { ChannelLinkRepository } from "./repository/channel_link_repository";
 import { TelegramManager } from "./service/telegram_manager";
 import { ChannelControlHub } from "./channels/core/channel_control";
 import { createTelegramRouter } from "./routes/telegram_routes";
+import { MarketplaceService } from "./core/marketplace/marketplace_service";
+import { MarketRepository } from "./repository/market_repository";
+import { MarketCatalogRepository } from "./repository/market_catalog_repository";
+import { createMarketApiRouter } from "./core/marketplace/api_v1";
+import { createMarketRouter } from "./routes/market_routes";
 import { SessionSummaryRepository } from "./repository/session_summary_repository";
 dotenv.config();
 
@@ -133,6 +143,8 @@ async function wa() {
     const artifactRepo = new ArtifactRepository(db);
     const artifactTools = createArtifactTools(artifactRepo);
     for (const t of artifactTools) toolRegistry.registerBuiltin(t);
+    const chartTools = createChartTools();
+    for (const t of chartTools) toolRegistry.registerBuiltin(t);
     // Long-term memory: facts about each user, saved by the assistant
     // (save_memory) or on the Memory page, recalled in every chat.
     // MEMORY_ENABLED=false turns the feature off for everyone.
@@ -144,11 +156,20 @@ async function wa() {
     const skillService = new SkillService(new SkillRepository(db));
     const skillTools = createSkillTools(skillService);
     for (const t of skillTools) toolRegistry.registerBuiltin(t);
+    // Word/Excel files built by the Python service (DocumentBuilder).
+    const documentService = new DocumentService(new DocumentRepository(db), s3Client);
+    const documentTools = createDocumentTools(documentService);
+    for (const t of documentTools) toolRegistry.registerBuiltin(t);
+    const loadGeneratedFile = (userId: string, id: string) => documentService.load(userId, id);
     const { providers, defaultProvider } = LLMFactory.createAllFromEnv(chatMessageService, toolRegistry, s3Client);
     // Record token usage for every chat turn, whichever feature started it.
     const usageRepo = new UsageRepository(db);
     // Subscriptions (Razorpay) and the monthly token quota of each plan.
     const billing = new BillingService(new BillingRepository(db));
+    // Model marketplace (OpenRouter models, prepaid credits, developer API).
+    const marketplace = new MarketplaceService(new MarketRepository(db), undefined, { catalogRepo: new MarketCatalogRepository(db) });
+    await marketplace.init();
+    billing.paymentHook = (payment) => marketplace.onRazorpayPayment(payment);
     UsageTrackingLLM.quotaGate = (userId) => billing.checkAllowed(userId);
     console.log(`[billing] payments ${billing.paymentsEnabled ? "on" : "off (no Razorpay keys)"}; quotas ${process.env.BILLING_ENABLED === "true" ? "enforced" : "not enforced (BILLING_ENABLED != true)"}`);
     for (const [id, llm] of providers) providers.set(id, new UsageTrackingLLM(llm, usageRepo));
@@ -162,6 +183,7 @@ async function wa() {
         messageService: chatMessageService,
         tools: toolRegistry,
         fileStore: s3Client,
+        marketplace,
     });
     const knowledgeBase = new KnowledgeBase(s3Client, embedder, vectorDb);
     // What part of a chat's history each request carries: recent messages
@@ -185,7 +207,7 @@ async function wa() {
         embed,
         usage: usageRepo,
         registry: modelRegistry,
-        alwaysTools: [...artifactTools, ...memoryTools, ...skillTools],
+        alwaysTools: [...artifactTools, ...chartTools, ...memoryTools, ...skillTools, ...documentTools],
     });
     // Provider-native agents (Claude Managed Agents / OpenAI Agents API), for
     // each provider that has an API key.
@@ -258,6 +280,7 @@ async function wa() {
             registry: modelRegistry,
             runtime,
             agents: agentDirectory,
+            files: loadGeneratedFile,
         }),
     });
     await whatsappManager.init();
@@ -278,6 +301,7 @@ async function wa() {
             registry: modelRegistry,
             runtime,
             agents: agentDirectory,
+            files: loadGeneratedFile,
         }),
     });
     await telegramManager.init();
@@ -310,6 +334,8 @@ async function wa() {
     // Safe on several servers (each slot is claimed atomically); turn off with
     // SCHEDULER_ENABLED=false to run it only on chosen instances.
     if (hostsJobs && process.env.SCHEDULER_ENABLED !== "false") agentScheduler.start();
+    // Nightly check of what each provider offers (new models → the owner's Discover list).
+    if (hostsJobs && process.env.MARKET_SYNC_ENABLED !== "false") marketplace.sync?.start();
     agentScheduler.useRuntime(runtime);
     const agentRoutes = new AgentRoutes(agentService);
     agentRoutes.setScheduler(agentScheduler);
@@ -340,10 +366,14 @@ async function wa() {
         { path: "/api/artifacts", router: createArtifactRouter(artifactRepo) },
         { path: "/api/memory", router: createMemoryRouter(memoryService) },
         { path: "/api/skills", router: createSkillRouter(skillService) },
+        { path: "/api/documents", router: createDocumentRouter(documentService) },
+        { path: "/api/market", router: createMarketRouter(marketplace) },
         { path: "/api/admin", router: createAdminRouter(settingsService, whatsappManager, { manager: telegramManager, verify: (t) => telegramBotInfo(t) }, { whatsapp: whatsappControl, telegram: telegramControl }) },
         { path: "/api/telegram", router: createTelegramRouter(chatMessageService, telegramLinks, telegramControl, settingsService) },
     ], [
         { path: "/api/billing/webhook", router: createBillingWebhookRouter(billing) },
+        // Developer API (its own sk-owl-… keys, not the app login).
+        { path: "/api/v1", router: createMarketApiRouter(marketplace) },
     ]);
     gateway.setStatus(() => ({ activeRuns: runtime.activeRuns(), busySessions: runtime.lanes.activeSessions() }));
     registerGauge("owl_active_turns", "Chat turns running in this process", () => runtime.activeRuns());
@@ -368,6 +398,7 @@ async function wa() {
         channelHub.stop();
         await whatsappManager.stop().catch(() => {});
         await telegramManager.stop().catch(() => {});
+        await marketplace.close().catch(() => {});
         await gateway.close(Number(process.env.SHUTDOWN_GRACE_MS ?? 25_000));
         await Promise.allSettled([closeRedis(), db.disconnect()]);
         process.exit(0);

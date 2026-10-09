@@ -786,6 +786,249 @@ export const migration_20261013100000: Migration = {
 };
 
 
+export const migration_20261014100000: Migration = {
+  version: "20261014100000",
+  description: "Generated Word/Excel files and each user's document style",
+  up: [
+    // Files the assistant created (create_word_document / create_excel_file),
+    // stored in S3 under generated/<user>/… (outside the knowledge base).
+    `CREATE TABLE IF NOT EXISTS generated_files (
+      id          TEXT PRIMARY KEY,
+      user_id     TEXT NOT NULL,
+      session_id  TEXT REFERENCES sessions(id) ON DELETE SET NULL,
+      kind        TEXT NOT NULL CHECK (kind IN ('word', 'excel')),
+      filename    TEXT NOT NULL,
+      mime        TEXT NOT NULL,
+      s3_key      TEXT NOT NULL,
+      size        INTEGER NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_generated_files_user ON generated_files(user_id, created_at DESC)`,
+    // Branding applied to every generated document.
+    `CREATE TABLE IF NOT EXISTS document_styles (
+      user_id     TEXT PRIMARY KEY,
+      company     TEXT NOT NULL DEFAULT '',
+      color       TEXT NOT NULL DEFAULT '#2A74A8',
+      font        TEXT NOT NULL DEFAULT 'Calibri',
+      footer      TEXT NOT NULL DEFAULT '',
+      currency    TEXT NOT NULL DEFAULT '₹',
+      logo        BYTEA,
+      logo_mime   TEXT,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS document_styles`,
+    `DROP TABLE IF EXISTS generated_files`,
+  ]
+};
+
+
+export const migration_20261015100000: Migration = {
+  version: "20261015100000",
+  description: "Model marketplace: prepaid credits, ledger, credit orders, developer API keys, favourite models",
+  up: [
+    // Prepaid balance per user, in nano-dollars (1 USD = 1e9) so per-token prices stay exact.
+    `CREATE TABLE IF NOT EXISTS market_wallets (
+      user_id        TEXT PRIMARY KEY,
+      balance_nanos  BIGINT NOT NULL DEFAULT 0,
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    // Every change to a balance: purchases (+), usage (-), refunds and admin adjustments.
+    `CREATE TABLE IF NOT EXISTS market_ledger (
+      id                  BIGSERIAL PRIMARY KEY,
+      user_id             TEXT NOT NULL,
+      kind                TEXT NOT NULL CHECK (kind IN ('purchase', 'usage', 'refund', 'adjustment')),
+      amount_nanos        BIGINT NOT NULL,
+      balance_after_nanos BIGINT NOT NULL,
+      upstream_nanos      BIGINT NOT NULL DEFAULT 0,
+      fee_paise           BIGINT NOT NULL DEFAULT 0,
+      paid_paise          BIGINT NOT NULL DEFAULT 0,
+      model               TEXT,
+      source              TEXT,
+      api_key_id          UUID,
+      session_id          TEXT,
+      generation_id       TEXT,
+      payment_id          TEXT,
+      input_tokens        BIGINT NOT NULL DEFAULT 0,
+      output_tokens       BIGINT NOT NULL DEFAULT 0,
+      note                TEXT,
+      created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_ledger_user ON market_ledger(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_market_ledger_time ON market_ledger(created_at)`,
+    // A payment can only ever be credited once.
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_market_ledger_payment ON market_ledger(payment_id) WHERE payment_id IS NOT NULL`,
+    // Razorpay orders for credit top-ups.
+    `CREATE TABLE IF NOT EXISTS market_orders (
+      id             TEXT PRIMARY KEY,
+      user_id        TEXT NOT NULL,
+      credits_nanos  BIGINT NOT NULL,
+      amount_paise   BIGINT NOT NULL,
+      fee_paise      BIGINT NOT NULL,
+      usd_inr        NUMERIC(10, 4) NOT NULL,
+      status         TEXT NOT NULL DEFAULT 'created',
+      payment_id     TEXT,
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      paid_at        TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_orders_user ON market_orders(user_id, created_at DESC)`,
+    // Developer API keys (sk-owl-…). Only a SHA-256 of the key is stored.
+    `CREATE TABLE IF NOT EXISTS market_api_keys (
+      id            UUID PRIMARY KEY,
+      user_id       TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      key_hash      TEXT NOT NULL UNIQUE,
+      key_prefix    TEXT NOT NULL,
+      key_last4     TEXT NOT NULL,
+      limit_nanos   BIGINT,
+      usage_nanos   BIGINT NOT NULL DEFAULT 0,
+      disabled      BOOLEAN NOT NULL DEFAULT false,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_used_at  TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_api_keys_user ON market_api_keys(user_id, created_at DESC)`,
+    // Models a user added to their chat model picker.
+    `CREATE TABLE IF NOT EXISTS market_favorites (
+      user_id     TEXT NOT NULL,
+      model_id    TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (user_id, model_id)
+    )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS market_favorites`,
+    `DROP TABLE IF EXISTS market_api_keys`,
+    `DROP TABLE IF EXISTS market_orders`,
+    `DROP TABLE IF EXISTS market_ledger`,
+    `DROP TABLE IF EXISTS market_wallets`,
+  ]
+};
+
+
+export const migration_20261016100000: Migration = {
+  version: "20261016100000",
+  description: "Marketplace phase 1: own provider accounts, own model catalogue and offers (model × provider × price)",
+  up: [
+    // The owner's upstream accounts (OpenAI, Anthropic, DeepInfra, Groq, …). Keys are encrypted.
+    `CREATE TABLE IF NOT EXISTS market_providers (
+      id          UUID PRIMARY KEY,
+      name        TEXT NOT NULL UNIQUE,
+      kind        TEXT NOT NULL CHECK (kind IN ('openai_compatible', 'anthropic', 'openrouter')),
+      base_url    TEXT NOT NULL,
+      api_key_enc TEXT NOT NULL,
+      key_hint    TEXT NOT NULL,
+      region      TEXT,
+      priority    INTEGER NOT NULL DEFAULT 100,
+      enabled     BOOLEAN NOT NULL DEFAULT true,
+      notes       TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    // The models the owner sells.
+    `CREATE TABLE IF NOT EXISTS market_models (
+      id                TEXT PRIMARY KEY,
+      name              TEXT NOT NULL,
+      author            TEXT NOT NULL,
+      description       TEXT NOT NULL DEFAULT '',
+      context_length    INTEGER,
+      max_output        INTEGER,
+      input_modalities  TEXT[] NOT NULL DEFAULT '{text}',
+      tools             BOOLEAN NOT NULL DEFAULT false,
+      reasoning         BOOLEAN NOT NULL DEFAULT false,
+      structured_output BOOLEAN NOT NULL DEFAULT false,
+      released          DATE,
+      hugging_face_id   TEXT,
+      featured          BOOLEAN NOT NULL DEFAULT false,
+      india_hosted      BOOLEAN NOT NULL DEFAULT false,
+      enabled           BOOLEAN NOT NULL DEFAULT true,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    // Which provider serves which model, under what name, at what upstream price (USD per 1M tokens).
+    `CREATE TABLE IF NOT EXISTS market_offers (
+      id              UUID PRIMARY KEY,
+      model_id        TEXT NOT NULL REFERENCES market_models(id) ON DELETE CASCADE,
+      provider_id     UUID NOT NULL REFERENCES market_providers(id) ON DELETE CASCADE,
+      upstream_model  TEXT NOT NULL,
+      input_per_m     NUMERIC(14, 6) NOT NULL DEFAULT 0,
+      output_per_m    NUMERIC(14, 6) NOT NULL DEFAULT 0,
+      cache_read_per_m NUMERIC(14, 6),
+      request_price   NUMERIC(14, 8) NOT NULL DEFAULT 0,
+      markup_pct      NUMERIC(6, 2),
+      context_length  INTEGER,
+      max_output      INTEGER,
+      quantization    TEXT,
+      priority        INTEGER NOT NULL DEFAULT 100,
+      enabled         BOOLEAN NOT NULL DEFAULT true,
+      created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (model_id, provider_id, upstream_model)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_offers_model ON market_offers(model_id)`,
+    // Which provider served each charged request (cost and margin per provider).
+    `ALTER TABLE market_ledger ADD COLUMN IF NOT EXISTS provider TEXT`,
+  ],
+  down: [
+    `ALTER TABLE market_ledger DROP COLUMN IF EXISTS provider`,
+    `DROP TABLE IF EXISTS market_offers`,
+    `DROP TABLE IF EXISTS market_models`,
+    `DROP TABLE IF EXISTS market_providers`,
+  ]
+};
+
+
+export const migration_20261017100000: Migration = {
+  version: "20261017100000",
+  description: "Marketplace phase 2: hourly provider health stats (requests, errors, latency) shared by every server",
+  up: [
+    `CREATE TABLE IF NOT EXISTS market_provider_stats (
+      provider_id     TEXT NOT NULL,
+      model_id        TEXT NOT NULL,
+      hour            TIMESTAMPTZ NOT NULL,
+      requests        INTEGER NOT NULL DEFAULT 0,
+      errors          INTEGER NOT NULL DEFAULT 0,
+      latency_ms_sum  BIGINT NOT NULL DEFAULT 0,
+      latency_count   INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (provider_id, model_id, hour)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_provider_stats_hour ON market_provider_stats(hour)`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS market_provider_stats`,
+  ]
+};
+
+
+export const migration_20261018100000: Migration = {
+  version: "20261018100000",
+  description: "Marketplace phase 3: models discovered from providers (for approval), provider sync status and monthly budgets",
+  up: [
+    // Model names each provider lists, found by the nightly sync — the owner adds or ignores them.
+    `CREATE TABLE IF NOT EXISTS market_discovered (
+      provider_id     UUID NOT NULL REFERENCES market_providers(id) ON DELETE CASCADE,
+      upstream_model  TEXT NOT NULL,
+      input_per_m     NUMERIC(14, 6),
+      output_per_m    NUMERIC(14, 6),
+      context_length  INTEGER,
+      status          TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'ignored', 'added')),
+      first_seen      TIMESTAMPTZ NOT NULL DEFAULT now(),
+      last_seen       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (provider_id, upstream_model)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_market_discovered_status ON market_discovered(status)`,
+    `ALTER TABLE market_providers ADD COLUMN IF NOT EXISTS budget_usd NUMERIC(12, 2)`,
+    `ALTER TABLE market_providers ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ`,
+    `ALTER TABLE market_providers ADD COLUMN IF NOT EXISTS sync_error TEXT`,
+  ],
+  down: [
+    `ALTER TABLE market_providers DROP COLUMN IF EXISTS sync_error`,
+    `ALTER TABLE market_providers DROP COLUMN IF EXISTS last_synced_at`,
+    `ALTER TABLE market_providers DROP COLUMN IF EXISTS budget_usd`,
+    `DROP TABLE IF EXISTS market_discovered`,
+  ]
+};
+
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -808,5 +1051,10 @@ export const migrations: Migration[] = [
   migration_20261010100000,
   migration_20261011100000,
   migration_20261012100000,
-  migration_20261013100000
+  migration_20261013100000,
+  migration_20261014100000,
+  migration_20261015100000,
+  migration_20261016100000,
+  migration_20261017100000,
+  migration_20261018100000
 ];

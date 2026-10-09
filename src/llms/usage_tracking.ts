@@ -54,7 +54,7 @@ export class UsageTrackingLLM implements ILLM {
 
     // `byok`: this provider runs on the user's own API key — no quota check,
     // and its usage is recorded as BYOK (excluded from the plan's quota).
-    constructor(private inner: ILLM, private usage: UsageRepository, private byok: { keyId: string } | null = null) {}
+    constructor(private inner: ILLM, private usage: UsageRepository, private byok: { keyId: string | null } | null = null) {}
 
     chat(messages: LLMMessage[], tools: Tool[]) { return this.inner.chat(messages, tools); }
     summarizeChat(message: any, userId: string, sessionId: string) { return this.inner.summarizeChat(message, userId, sessionId); }

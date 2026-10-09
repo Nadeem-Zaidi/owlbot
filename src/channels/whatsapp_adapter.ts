@@ -1,6 +1,6 @@
 import { IChannel } from "../interfaces/ichannel";
 import { WhatsAppRepository } from "../repository/whatsapp_repository";
-import { ChannelLink, ChannelLinkStore, ChatAdapter, InboundMessage } from "./core/chat_adapter";
+import { ChannelLink, ChannelLinkStore, ChatAdapter, InboundMessage, OutboundFile } from "./core/chat_adapter";
 import { chunkMessage, toWhatsApp } from "./whatsapp_format";
 
 // The WhatsApp channel (Baileys) as a ChatAdapter. Chat ids are WhatsApp
@@ -30,6 +30,11 @@ export class WhatsAppAdapter implements ChatAdapter {
 
     send(chatId: string, text: string) {
         return this.channel.send(`whatsapp:${chatId}`, text);
+    }
+
+    async sendFile(chatId: string, file: OutboundFile) {
+        if (!this.channel.sendFile) throw new Error("this WhatsApp channel can't send files");
+        await this.channel.sendFile(`whatsapp:${chatId}`, file);
     }
 
     async setTyping(chatId: string, typing: boolean) {

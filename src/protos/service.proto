@@ -40,3 +40,30 @@ message RunPythonResponse{
     string error=4;         // set when ok is false
     int32 duration_ms=5;
 }
+
+
+// Builds Word (.docx) and Excel (.xlsx) files for the assistant's
+// create_word_document / create_excel_file tools.
+service DocumentBuilder{
+    rpc BuildWord(BuildDocumentRequest) returns (BuildDocumentResponse);
+    rpc BuildExcel(BuildDocumentRequest) returns (BuildDocumentResponse);
+    // A preview for the in-app viewer: Word → HTML, Excel → cell grid (JSON in content).
+    rpc PreviewDocument(PreviewDocumentRequest) returns (BuildDocumentResponse);
+}
+
+message BuildDocumentRequest{
+    string spec_json=1;    // Word: {title, subtitle?, markdown}; Excel: {title?, sheets:[{name, columns, rows, totals?}]}
+    string style_json=2;   // {company?, color?, font?, footer?, currency?}
+    bytes logo=3;          // optional PNG/JPEG for the Word header
+}
+
+message PreviewDocumentRequest{
+    string kind=1;         // "word" | "excel"
+    bytes content=2;       // the .docx / .xlsx file
+}
+
+message BuildDocumentResponse{
+    bool ok=1;
+    bytes content=2;       // the file
+    string error=3;        // when ok is false: what to fix (shown to the assistant)
+}

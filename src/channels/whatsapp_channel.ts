@@ -151,6 +151,17 @@ export class WhatsAppChannel implements IChannel {
         this.rememberSent(sent?.key?.id);
     }
 
+    async sendFile(sessionKey: string, file: { buffer: Buffer; filename: string; mime: string; caption?: string }): Promise<void> {
+        if (!this.sock) throw new Error("WhatsApp not connected. Call start() first.");
+        const jid = this.toJid(sessionKey);
+        if (this.selfChat && !this.isSelfChat(jid)) {
+            console.warn(`[whatsapp] self-chat mode: not sending a file to ${WhatsAppChannel.userPart(jid)}`);
+            return;
+        }
+        const sent = await this.sock.sendMessage(jid, { document: file.buffer, fileName: file.filename, mimetype: file.mime, caption: file.caption });
+        this.rememberSent(sent?.key?.id);
+    }
+
     async setTyping(sessionKey: string, typing: boolean): Promise<void> {
         if (!this.sock) return;
         try {

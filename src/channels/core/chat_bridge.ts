@@ -22,6 +22,8 @@ export type ChatBridgeDeps = {
     // above when not given (tests).
     runtime?: AgentRuntime;
     agents?: AgentDirectory;
+    // Loads a generated Word/Excel file so it can be sent as an attachment.
+    files?: (userId: string, fileId: string) => Promise<{ buffer: Buffer; filename: string; mime: string }>;
 };
 
 const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
@@ -387,6 +389,22 @@ export class ChatBridge {
         }
         if (error) body += `\n\n⚠️ ${error}`;
         await this.reply(chatId, body);
+        await this.deliverFiles(link, reply.files ?? []);
+    }
+
+    // Generated Word/Excel files go to the chat as attachments; when the app
+    // can't take files, the user is pointed to the web app instead.
+    private async deliverFiles(link: ChannelLink, files: NonNullable<Awaited<ReturnType<AgentRuntime["runToText"]>>["files"]>) {
+        for (const f of files.slice(0, 5)) {
+            try {
+                if (!this.deps.files || !this.deps.adapter.sendFile) throw new Error("files not supported here");
+                const file = await this.deps.files(link.userId, f.id);
+                await this.deps.adapter.sendFile(link.chatId, { ...file, caption: f.filename });
+            } catch (err) {
+                console.warn(`[${this.adapter.id}-bridge] couldn't send ${f.filename}:`, err instanceof Error ? err.message : err);
+                await this.reply(link.chatId, `📎 **${f.filename}** is ready — download it from this chat in Owl Bot on the web.`);
+            }
+        }
     }
 
     private async ensureSession(link: ChannelLink): Promise<string> {

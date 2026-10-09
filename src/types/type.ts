@@ -96,6 +96,10 @@ export interface ToolDefinition {
       type: string;
       description?: string;
       enum?: any[];
+      // Nested JSON Schema (arrays of objects, e.g. an Excel file's sheets).
+      items?: Record<string, any>;
+      properties?: Record<string, any>;
+      required?: string[];
     }>;
     required: string[];
   };

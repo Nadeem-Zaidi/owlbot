@@ -24,6 +24,7 @@ type BridgeDeps = {
     // Runs each turn — the same runtime as the web app.
     runtime?: AgentRuntime;
     agents?: AgentDirectory;
+    files?: (userId: string, fileId: string) => Promise<{ buffer: Buffer; filename: string; mime: string }>;
 };
 
 // WhatsApp on top of the generic ChatBridge (linking, commands, documents,
@@ -44,6 +45,7 @@ export class WhatsAppBridge extends ChatBridge {
             registry: deps.registry,
             runtime: deps.runtime,
             agents: deps.agents,
+            files: deps.files,
         });
         this.channel = deps.channel;
         this.repo = deps.repo;

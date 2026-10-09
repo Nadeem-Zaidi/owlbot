@@ -150,7 +150,7 @@ export class OpenAICompatibleProvider implements ILLM {
     // Yields text deltas as they arrive; returns the full turn at the end.
     private async *streamOnce(body: Record<string, unknown>, signal: AbortSignal): AsyncGenerator<
         { delta: string },
-        { text: string; toolCalls: WireToolCall[]; finishReason: string | null; usage: TokenCounts | null; model: string | null }
+        { text: string; toolCalls: WireToolCall[]; finishReason: string | null; usage: TokenCounts | null; model: string | null; cost?: number }
     > {
         const timeout = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
         const res = await fetch(`${this.baseUrl}/chat/completions`, {
@@ -168,6 +168,7 @@ export class OpenAICompatibleProvider implements ILLM {
         let finishReason: string | null = null;
         let usage: TokenCounts | null = null;
         let model: string | null = null;
+        let cost: number | undefined;
         const calls = new Map<number, WireToolCall>();
         const decoder = new TextDecoder();
         let buffer = "";
@@ -189,7 +190,11 @@ export class OpenAICompatibleProvider implements ILLM {
                     try { evt = JSON.parse(data); } catch { continue; }
                     if (evt.error) throw new ProviderHttpError(500, String(evt.error.message ?? evt.error));
                     if (evt.model) model = evt.model;
-                    if (evt.usage) usage = toCounts(evt.usage);
+                    if (evt.usage) {
+                        usage = toCounts(evt.usage);
+                        // OpenRouter reports what the call cost (USD).
+                        if (typeof evt.usage.cost === "number") cost = evt.usage.cost;
+                    }
                     const choice = evt.choices?.[0];
                     if (!choice) continue;
                     const delta = choice.delta ?? {};
@@ -212,7 +217,7 @@ export class OpenAICompatibleProvider implements ILLM {
             reader.releaseLock();
         }
         const toolCalls = [...calls.values()].filter((c) => c.function.name).map((c, i) => ({ ...c, id: c.id || `call_${Date.now()}_${i}` }));
-        return { text, toolCalls, finishReason, usage, model };
+        return { text, toolCalls, finishReason, usage, model, cost };
     }
 
     async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, _apiKey: string, signal: AbortSignal, model?: string, run?: ChatRunOptions): AsyncGenerator<LLMMessage, void, unknown> {
@@ -262,7 +267,7 @@ export class OpenAICompatibleProvider implements ILLM {
                 ...(tools.length ? { tools } : {}),
             };
 
-            let turn: { text: string; toolCalls: WireToolCall[]; finishReason: string | null; usage: TokenCounts | null; model: string | null };
+            let turn: { text: string; toolCalls: WireToolCall[]; finishReason: string | null; usage: TokenCounts | null; model: string | null; cost?: number };
             let streamed = "";
             try {
                 const gen = this.streamOnce(body, signal);
@@ -295,7 +300,10 @@ export class OpenAICompatibleProvider implements ILLM {
                 return;
             }
 
-            if (turn.usage) yield usageIncrement(turn.usage, turn.model ?? activeModel);
+            if (turn.usage) {
+                const inc = usageIncrement(turn.usage, turn.model ?? activeModel);
+                yield (turn.cost !== undefined ? { ...inc, cost_usd: turn.cost } : inc) as LLMMessage;
+            }
 
             if (turn.text) {
                 await this.messageService.createLLMMessage(sessionId, {

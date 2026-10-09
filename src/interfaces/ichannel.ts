@@ -35,6 +35,8 @@ export interface IChannel{
     onMessage(handler:(msg:IncomingMessage)=>Promise<void>):void
     // Optional extras a chat-app channel can offer.
     setTyping?(sessionKey:string,typing:boolean):Promise<void>;
+    // Sends a document (e.g. a generated Word/Excel file).
+    sendFile?(sessionKey:string,file:{buffer:Buffer;filename:string;mime:string;caption?:string}):Promise<void>;
     getStatus?():ChannelStatus;
     // Starts (or restarts) pairing so a fresh QR becomes available.
     pair?():Promise<void>;

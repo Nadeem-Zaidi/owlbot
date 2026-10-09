@@ -8,8 +8,16 @@ export async function collectReply(stream: AsyncIterable<LLMMessage>): Promise<C
     let sources: string[] = [];
     let error: string | null = null;
     let cancelled = false;
+    const files: NonNullable<CollectedReply["files"]> = [];
     for await (const chunk of stream) {
         const c = chunk as any;
+        if (c.type === "function_call_output" && c.output) {
+            let out = c.output;
+            if (typeof out === "string") { try { out = JSON.parse(out); } catch { out = null; } }
+            const f = out?.generated_file;
+            if (f && typeof f.id === "string" && typeof f.filename === "string") files.push({ id: f.id, filename: f.filename, kind: f.kind, size: f.size });
+            continue;
+        }
         if (c.type === "message" && c.role === "assistant" && Array.isArray(c.content)) {
             for (const part of c.content) if (part?.type === "text") text += part.text ?? "";
         } else if (c.type === "function_call" && text && !text.endsWith("\n")) {
@@ -24,5 +32,5 @@ export async function collectReply(stream: AsyncIterable<LLMMessage>): Promise<C
             cancelled = true;
         }
     }
-    return { text, sources, error, cancelled };
+    return { text, sources, error, cancelled, files };
 }

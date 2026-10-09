@@ -54,6 +54,9 @@ export class BillingService {
 
     get paymentsEnabled() { return !!this.razorpay; }
 
+    // Set by the marketplace: credits payments for its credit orders (true = handled).
+    paymentHook: ((payment: any) => Promise<boolean>) | null = null;
+
     // Remembers a signed-in user's email once per process (needed for exemptions).
     async rememberUser(userId: string, email?: string | null): Promise<void> {
         if (!email || this.knownUsers.has(userId)) return;
@@ -184,6 +187,7 @@ export class BillingService {
                     this.quotaCache.delete(sub.user_id);
                 }
             }
+            if (p?.id && this.paymentHook && p.order_id) await this.paymentHook(p);
             if (p?.id) {
                 const userId = sub?.user_id ?? (p.notes?.user_id ? String(p.notes.user_id) : null);
                 if (userId) {

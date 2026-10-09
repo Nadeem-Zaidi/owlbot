@@ -36,4 +36,6 @@ export type CollectedReply = {
     sources: string[];
     error: string | null;
     cancelled: boolean;
+    // Word/Excel files the assistant created in this turn.
+    files?: { id: string; filename: string; kind: string; size: number }[];
 };
