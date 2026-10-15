@@ -395,7 +395,7 @@ async function wa() {
     if (hostsJobs && process.env.SCHEDULER_ENABLED !== "false") automationService.start();
 
     // Agent Studio: visual agent projects, run by the workflow engine.
-    studioService = new StudioService(new StudioRepository(db), agentRepo, agentService, pipelineService);
+    studioService = new StudioService(new StudioRepository(db), agentRepo, agentService, pipelineService, chatMessageService);
     if (hostsJobs && process.env.SCHEDULER_ENABLED !== "false") studioService.start();
 
     const { searchRouter, usageRouter } = createInsightsRouters(new SearchRepository(db), usageRepo);

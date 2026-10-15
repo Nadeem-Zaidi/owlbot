@@ -223,6 +223,22 @@ export function compileFlow(canvas: StudioCanvas, agentIdOf: (nodeId: string) =>
     return { version: 1, nodes, edges };
 }
 
+// An agent can appear several times (e.g. Jira at the start and the end).
+// Its settings — what's plugged into it — live on one "primary" node: the
+// occurrence with the most sub-nodes (first one on ties). The others share
+// them and only have their own task.
+export function primaryAgentNodes(canvas: StudioCanvas): Map<string, string> {
+    const subCount = (id: string) => canvas.edges.filter((e) => e.to === id && e.port).length;
+    const primary = new Map<string, { id: string; subs: number }>();
+    for (const n of canvas.nodes) {
+        if (n.type !== "agent" || !n.agent_id) continue;
+        const subs = subCount(n.id);
+        const cur = primary.get(n.agent_id);
+        if (!cur || subs > cur.subs) primary.set(n.agent_id, { id: n.id, subs });
+    }
+    return new Map([...primary].map(([agentId, p]) => [agentId, p.id]));
+}
+
 // Keeps the canvas true to the agents as they are now (they can also be
 // edited on the Agents page): refreshes each agent node's draft and
 // re-creates its sub-nodes from the agent's settings, keeping the positions
@@ -233,6 +249,7 @@ export function syncFromAgents(canvas: StudioCanvas, rows: Map<string, AgentRow>
     let edges = [...canvas.edges];
     const byId = new Map(nodes.map((n) => [n.id, n]));
     const drop = new Set<string>();
+    const primary = primaryAgentNodes(canvas);
 
     for (let i = 0; i < nodes.length; i++) {
         const n = nodes[i];
@@ -243,6 +260,11 @@ export function syncFromAgents(canvas: StudioCanvas, rows: Map<string, AgentRow>
             continue;
         }
         nodes[i] = { ...n, agent: { name: row.name, icon: row.icon || "🤖", description: row.description ?? "", instructions: row.instructions ?? "" } };
+        // Repeats of an agent share the primary's sub-nodes.
+        if (primary.get(n.agent_id) !== n.id) {
+            for (const e of edges) if (e.to === n.id && e.port) drop.add(e.from);
+            continue;
+        }
 
         const want: { type: SubNodeType; key: string; make: (id: string, position: { x: number; y: number }) => StudioNode }[] = [];
         if (row.provider) want.push({ type: "model", key: `${row.provider}|${row.model ?? ""}`, make: (id, position) => ({ id, type: "model", position, provider: row.provider!, model: row.model ?? null }) });

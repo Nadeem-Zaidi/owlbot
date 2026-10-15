@@ -132,8 +132,8 @@ export class AgentService {
 
     // Checks an agent body without saving it (Agent Studio validates every
     // agent on its canvas before writing any of them).
-    async checkInput(userId: string, body: any): Promise<void> {
-        await this.validateAgent(userId, body);
+    async checkInput(userId: string, body: any): Promise<AgentInput> {
+        return this.validateAgent(userId, body);
     }
 
     private async requireAgent(userId: string, id: string): Promise<AgentRow> {

@@ -5,7 +5,7 @@ import { runPython } from "../../protos/client";
 import { EmbeddingProvider, createVectorSearchTool } from "../../tools/vector_tool";
 import { ToolContext, ToolDefinition } from "../../types/type";
 import { KnowledgeBase } from "../knowledge_base";
-import { McpPool } from "./mcp_pool";
+import { McpPool, normalizeCloudId } from "./mcp_pool";
 import { decryptSecret } from "./secrets";
 import { assertPublicUrl } from "./url_guard";
 
@@ -188,16 +188,58 @@ export function mcpToolName(serverName: string, toolName: string): string {
 
 function mcpTools(server: AgentMcpServerRow, pool: McpPool): ToolDefinition[] {
     const token = server.auth_token ? decryptSecret(server.auth_token) : null;
+    const target = { url: server.url, token };
+    const atlassian = isAtlassian(server.url);
     return server.tools.filter((t) => t.enabled).map((t) => {
         const schema = (t.inputSchema ?? {}) as Record<string, any>;
+        let properties = schema.properties ?? {};
+        let required: string[] = schema.required ?? [];
+        // Atlassian: the site's cloudId is filled in for the model (it can't
+        // know it and tends to invent one).
+        const autoCloudId = atlassian && "cloudId" in properties;
+        if (autoCloudId) {
+            properties = { ...properties, cloudId: { ...properties.cloudId, description: "The user's Atlassian site: its address (e.g. https://yourcompany.atlassian.net — use it if the user or your instructions give one) or its UUID. Leave empty to use the site already found." } };
+            required = required.filter((r) => r !== "cloudId");
+        }
         return {
             name: mcpToolName(server.name, t.name),
             description: `[${server.name}] ${t.description ?? t.name}`.slice(0, 1024),
-            parameters: { ...schema, type: "object", properties: schema.properties ?? {}, required: schema.required ?? [] } as ToolDefinition["parameters"],
-            execute: (args: Record<string, any>) => pool.callTool(server.id, { url: server.url, token }, t.name, args),
+            parameters: { ...schema, type: "object", properties, required } as ToolDefinition["parameters"],
+            execute: async (args: Record<string, any>) => {
+                if (!autoCloudId) return pool.callTool(server.id, target, t.name, args);
+                const given = normalizeCloudId(args.cloudId);
+                args = { ...args, cloudId: given ?? await pool.atlassianCloudId(server.id, target) };
+                let out: string;
+                try {
+                    out = await pool.callTool(server.id, target, t.name, args);
+                } catch (err) {
+                    // A site without Confluence answers 404 "Site temporarily
+                    // unavailable" — misleading; models then retry or give up
+                    // when they meant to change a Jira issue.
+                    const msg = err instanceof Error ? err.message : String(err);
+                    if (/confluence/i.test(t.name) && /404|temporarily unavailable/i.test(msg)) {
+                        throw new Error(
+                            "Confluence isn't available on this Atlassian site (it only has Jira). " +
+                            "To change a Jira issue (description, summary, fields), call editJiraIssue with its key, e.g. issueIdOrKey \"KAN-4\" and fields { description: \"…\" }. " +
+                            "To add a note, use addOrEditJiraIssueComment. Don't use Confluence tools for Jira issues.",
+                        );
+                    }
+                    throw err;
+                }
+                pool.rememberCloudId(server.id, target, String(args.cloudId).trim());
+                return out;
+            },
         };
     });
 }
+
+const isAtlassian = (url: string) => {
+    try {
+        return new URL(url).hostname.toLowerCase() === "mcp.atlassian.com";
+    } catch {
+        return false;
+    }
+};
 
 // ── The agent's tool set ─────────────────────────────────────────────────
 export class AgentToolSet implements ToolSource {

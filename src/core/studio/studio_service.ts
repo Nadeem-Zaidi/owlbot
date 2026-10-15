@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { AgentRepository, AgentRow } from "../../repository/agent_repository";
 import { StudioProjectRow, StudioRepository } from "../../repository/studio_repository";
 import { AgentError, AgentService } from "../../service/agents/agent_service";
@@ -6,7 +6,9 @@ import { PipelineService } from "../../service/agents/pipeline_service";
 import { computeNextRun, describeTiming } from "../../service/agents/schedule_time";
 import { decryptSecret, encryptSecret } from "../../service/agents/secrets";
 import { validateFlow, FlowError } from "../flows/flow_validate";
-import { agentBody, attachments, compileFlow, parseCanvas, StudioError, syncFromAgents } from "./studio_canvas";
+import { renderTemplate } from "../flows/flow_rules";
+import { MessageService } from "../../service/message_service";
+import { agentBody, Attachments, attachments, compileFlow, parseCanvas, primaryAgentNodes, StudioError, syncFromAgents } from "./studio_canvas";
 import { StudioCanvas, StudioNode, TriggerConfig } from "./studio_types";
 
 const TICK_MS = 30_000;
@@ -34,12 +36,15 @@ type AgentNode = Extract<StudioNode, { type: "agent" }>;
 // are the Workflows engine's.
 export class StudioService {
     private timer: NodeJS.Timeout | null = null;
+    private testing = new Set<string>();     // users with a "Test this step" running
 
     constructor(
         private repo: StudioRepository,
         private agentRepo: AgentRepository,
         private agents: AgentService,
         private pipelines: PipelineService,
+        // For "Test this step" (a throwaway chat per test).
+        private messages?: MessageService,
     ) {}
 
     // ── projects ──
@@ -74,31 +79,46 @@ export class StudioService {
         }
 
         // 1. Every agent's settings (with what's plugged into it) are valid.
+        // An existing agent may appear several times: its occurrences form
+        // one group — one agent to validate and save, settings from the
+        // primary node, sub-nodes from all of them; each keeps its own task.
         const agentNodes = canvas.nodes.filter((n): n is AgentNode => n.type === "agent");
         if (!agentNodes.length) throw new StudioError("Add at least one agent");
-        const rows = new Map<string, AgentRow>();
-        const bodies = new Map<string, ReturnType<typeof agentBody>>();
         for (const n of agentNodes) {
-            const row = n.agent_id ? await this.agentRepo.getAgent(n.agent_id, userId) : null;
-            if (n.agent_id && !row) n.agent_id = null;            // deleted meanwhile → create again
-            if (row) rows.set(n.id, row);
-            const b = agentBody(n.agent, attachments(canvas, n.id), row);
-            await this.agents.checkInput(userId, b).catch((err) => { throw asStudio(err, `"${n.label || n.agent.name}"`); });
-            bodies.set(n.id, b);
+            if (n.agent_id && !(await this.agentRepo.getAgent(n.agent_id, userId))) n.agent_id = null;  // deleted meanwhile → create again
         }
-        const names = agentNodes.map((n) => n.agent.name.toLowerCase());
+        const primary = primaryAgentNodes(canvas);
+        const groups = new Map<string, AgentNode[]>();      // agent id, or node id for a new agent
+        for (const n of agentNodes) {
+            const key = n.agent_id ?? `node:${n.id}`;
+            groups.set(key, [...(groups.get(key) ?? []), n]);
+        }
+        const bodies = new Map<string, ReturnType<typeof agentBody>>();
+        for (const [key, members] of groups) {
+            const lead = members.find((m) => m.id === primary.get(key)) ?? members[0];
+            const row = lead.agent_id ? await this.agentRepo.getAgent(lead.agent_id, userId) : null;
+            const att = mergeAttachments(members.map((m) => attachments(canvas, m.id)));
+            const b = agentBody(lead.agent, att, row);
+            await this.agents.checkInput(userId, b).catch((err) => { throw asStudio(err, `"${lead.label || lead.agent.name}"`); });
+            bodies.set(key, b);
+        }
+        const leads = [...groups.values()].map((m) => m[0]);
+        const names = leads.map((n) => n.agent.name.toLowerCase());
         const dup = names.find((x, i) => names.indexOf(x) !== i);
-        if (dup) throw new StudioError(`Two agents are called "${agentNodes.find((n) => n.agent.name.toLowerCase() === dup)!.agent.name}" — give each its own name`);
+        if (dup) throw new StudioError(`Two different agents are called "${leads.find((n) => n.agent.name.toLowerCase() === dup)!.agent.name}" — give each its own name`);
 
         // 2. The flow is valid (new agents stand in with placeholder ids).
         const placeholder = (nodeId: string) => canvas.nodes.find((n): n is AgentNode => n.id === nodeId && n.type === "agent")?.agent_id ?? `new-${nodeId}`;
         await this.checkFlow(userId, compileFlow(canvas, placeholder, deliver ? { projectName: name } : null));
 
-        // 3. Write the agents (real ones, also on the Agents page).
-        for (const n of agentNodes) {
-            const b = bodies.get(n.id)!;
-            if (n.agent_id) await this.agents.update(userId, n.agent_id, b);
-            else n.agent_id = (await this.agents.create(userId, b)).id;
+        // 3. Write the agents (real ones, also on the Agents page), once each.
+        for (const [key, members] of groups) {
+            const b = bodies.get(key)!;
+            if (members[0].agent_id) await this.agents.update(userId, members[0].agent_id, b);
+            else {
+                const created = await this.agents.create(userId, b);
+                for (const m of members) m.agent_id = created.id;
+            }
         }
 
         // 4. The workflow that runs it, then the project.
@@ -132,7 +152,7 @@ export class StudioService {
         if (!row) throw new StudioError("Project not found", 404);
         if (row.pipeline_id) await this.pipelines.remove(userId, row.pipeline_id).catch(() => {});
         // The agents stay: they're regular agents, also used elsewhere.
-        return { agents_kept: row.canvas.nodes.filter((n) => n.type === "agent" && n.agent_id).length };
+        return { agents_kept: new Set(row.canvas.nodes.flatMap((n) => (n.type === "agent" && n.agent_id ? [n.agent_id] : []))).size };
     }
 
     // ── running ──
@@ -147,6 +167,53 @@ export class StudioService {
         const run = await this.pipelines.start(row.user_id, row.pipeline_id, input).catch((err) => { throw asStudio(err); });
         await this.repo.touchTriggered(row.id).catch(() => {});
         return run;
+    }
+
+    // ── "Test this step" ──
+    // Runs one agent with sample input, as it's set up on the canvas right
+    // now (unsaved edits included) — nothing is saved. An existing agent
+    // keeps its MCP servers and functions. The sample stands in for both
+    // {{input}} and {{previous}}; {{node.…}} references are left empty.
+    async testStep(userId: string, body: any) {
+        if (!this.messages) throw new StudioError("Testing isn't available on this server", 503);
+        const node = body?.node;
+        const subs: any[] = Array.isArray(body?.subs) ? body.subs.slice(0, 40) : [];
+        if (node?.type !== "agent") throw new StudioError("Choose an agent to test");
+        const sample = typeof body?.input === "string" ? body.input.slice(0, MAX_INPUT_CHARS) : "";
+        if (this.testing.has(userId)) throw new StudioError("A test is already running — wait for it to finish", 429);
+
+        // The agent and what's plugged into it, checked like a save would.
+        const mini = parseCanvas({
+            nodes: [{ id: "testtrigger", type: "trigger", position: { x: 0, y: 0 }, trigger: { type: "manual" } }, node, ...subs],
+            edges: subs.map((sub) => ({ id: `${sub?.id}-${node.id}`, from: sub?.id, to: node.id })),
+        }, userId);
+        const agentNode = mini.nodes.find((n): n is AgentNode => n.type === "agent")!;
+        const row = agentNode.agent_id ? await this.agentRepo.getAgent(agentNode.agent_id, userId) : null;
+        const settings = await this.agents.checkInput(userId, agentBody(agentNode.agent, attachments(mini, agentNode.id), row))
+            .catch((err) => { throw asStudio(err); });
+        const now = new Date();
+        const agent: AgentRow = {
+            ...(row ?? { id: `studio-test-${randomUUID()}`, user_id: userId, created_at: now, updated_at: now }),
+            ...settings,
+            skill_mode: settings.skill_mode ?? row?.skill_mode ?? "all",
+            skill_ids: settings.skill_ids ?? row?.skill_ids ?? [],
+        } as AgentRow;
+
+        const task = agentNode.instruction.trim() || "{{previous}}";
+        const filled = renderTemplate(task, sample, sample, {});
+        // Same rule as a run: without any placeholder the input goes at the end.
+        const prompt = /\{\{\s*(input|previous|node\.[A-Za-z0-9_-]+)\s*\}\}/.test(task) ? filled : `${filled}\n\n---\nInput:\n${sample}`;
+
+        this.testing.add(userId);
+        const session = await this.messages.createSession(userId, "pipeline", `🧪 Test · ${agent.name}`);
+        const started = Date.now();
+        try {
+            const r = await this.agents.runOnce(agent, userId, session.id, prompt, AbortSignal.timeout(180_000));
+            return { output: r.text, error: r.error, prompt: prompt.slice(0, 4000), duration_ms: Date.now() - started };
+        } finally {
+            this.testing.delete(userId);
+            await this.messages.deleteSession(session.id, userId).catch(() => {});
+        }
     }
 
     // ── webhook trigger ──
@@ -254,7 +321,17 @@ export class StudioService {
 
     private summary(r: StudioProjectRow) {
         const trigger = this.trigger(r.canvas);
-        const agents = r.canvas.nodes.filter((n): n is AgentNode => n.type === "agent");
+        // Each agent once, even when it appears several times.
+        const seen = new Set<string>();
+        const agents: AgentNode[] = [];
+        for (const n of r.canvas.nodes) {
+            if (n.type !== "agent") continue;
+            if (n.agent_id) {
+                if (seen.has(n.agent_id)) continue;
+                seen.add(n.agent_id);
+            }
+            agents.push(n);
+        }
         return {
             id: r.id,
             name: r.name,
@@ -274,4 +351,15 @@ export class StudioService {
             updated_at: r.updated_at,
         };
     }
+}
+
+// Sub-nodes plugged into any occurrence of an agent (its first model wins).
+function mergeAttachments(list: Attachments[]): Attachments {
+    const uniq = (xs: string[]) => [...new Set(xs)];
+    return {
+        model: list.find((a) => a.model)?.model ?? null,
+        tools: uniq(list.flatMap((a) => a.tools)),
+        documentKeys: uniq(list.flatMap((a) => a.documentKeys)),
+        skills: uniq(list.flatMap((a) => a.skills)),
+    };
 }

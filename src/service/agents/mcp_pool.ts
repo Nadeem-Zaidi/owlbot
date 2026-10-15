@@ -15,8 +15,22 @@ const MAX_RESULT_CHARS = 20_000;
 
 export type McpTarget = { url: string; token?: string | null };
 
+// How the token field becomes the Authorization header:
+//   "Basic …" / "Bearer …"     → sent as typed
+//   "you@company.com:TOKEN"    → "Basic base64(email:token)" (Atlassian and
+//                                 other email + API-token servers)
+//   anything else              → "Bearer <token>"
+export function authHeader(token?: string | null): string | null {
+    const t = (token ?? "").trim();
+    if (!t) return null;
+    if (/^(basic|bearer)\s+\S/i.test(t)) return t;
+    if (/^[^\s:@]+@[^\s:@]+\.[^\s:@]+:\S+$/.test(t)) return `Basic ${Buffer.from(t, "utf8").toString("base64")}`;
+    return `Bearer ${t}`;
+}
+
 function headers(token?: string | null): Record<string, string> {
-    return token ? { Authorization: `Bearer ${token}` } : {};
+    const value = authHeader(token);
+    return value ? { Authorization: value } : {};
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -90,6 +104,36 @@ export function mcpResultToText(result: any): string {
     return text.length > MAX_RESULT_CHARS ? text.slice(0, MAX_RESULT_CHARS) + "\n…[truncated]" : text;
 }
 
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+
+// The first site id in getAccessibleAtlassianResources' answer (a JSON list
+// of { id, url, name, … }, possibly wrapped).
+export function findCloudId(text: string): string | null {
+    try {
+        const data = JSON.parse(text);
+        const list: any[] = Array.isArray(data) ? data : Array.isArray(data?.resources) ? data.resources : Array.isArray(data?.sites) ? data.sites : [data];
+        const site = list.find((s) => typeof s?.id === "string" && UUID_RE.test(s.id));
+        if (site) return site.id;
+    } catch {
+        // not JSON — fall back to the first id-looking value
+    }
+    return text.match(UUID_RE)?.[0] ?? null;
+}
+
+// A cloudId as Atlassian wants it: a site UUID as is, or any address on a
+// site ("https://acme.atlassian.net/jira/...?x=1") trimmed to
+// "https://acme.atlassian.net". Anything else (empty, made up) → null.
+export function normalizeCloudId(v: unknown): string | null {
+    if (typeof v !== "string") return null;
+    const t = v.trim();
+    const uuid = t.match(new RegExp(`^${UUID_RE.source}$`, "i"));
+    if (uuid) return uuid[0];
+    const site = t.match(/^(?:https?:\/\/)?([a-z0-9][a-z0-9-]*\.atlassian\.net)(?:[/?#].*)?$/i);
+    return site ? `https://${site[1].toLowerCase()}` : null;
+}
+
+export const isRealCloudId = (v: unknown) => normalizeCloudId(v) !== null;
+
 // Keeps one open connection per server and closes idle ones.
 export class McpPool {
     private clients = new Map<string, { client: Promise<Client>; key: string; lastUsed: number }>();
@@ -111,6 +155,38 @@ export class McpPool {
             this.drop(serverId);
             throw err;
         }
+    }
+
+    // Atlassian's MCP server needs the site's cloudId on every call, and API
+    // tokens aren't tied to a site. Looked up once (first accessible site)
+    // and cached for an hour.
+    private cloudIds = new Map<string, { id: string; key: string; at: number }>();
+
+    async atlassianCloudId(serverId: string, target: McpTarget): Promise<string> {
+        const key = `${target.url}|${target.token ?? ""}`;
+        const cached = this.cloudIds.get(serverId);
+        if (cached && cached.key === key && Date.now() - cached.at < 3600_000) return cached.id;
+        let text: string;
+        try {
+            text = await this.callTool(serverId, target, "getAccessibleAtlassianResources", {});
+        } catch (err) {
+            // Tokens without read:me / read:account can't list sites — the
+            // site's address works just as well, so ask for it.
+            throw new Error(
+                "The Atlassian site couldn't be looked up automatically (the API token doesn't allow it). " +
+                "Ask the user for their Jira/Confluence site address (like https://yourcompany.atlassian.net) and pass it as cloudId. " +
+                `Details: ${err instanceof Error ? err.message.slice(0, 300) : String(err)}`,
+            );
+        }
+        const id = findCloudId(text);
+        if (!id) throw new Error("No Atlassian site found for this token. Ask the user for their site address (like https://yourcompany.atlassian.net) and pass it as cloudId.");
+        this.rememberCloudId(serverId, target, id);
+        return id;
+    }
+
+    // A site that worked (e.g. given by the user) is used for later calls.
+    rememberCloudId(serverId: string, target: McpTarget, id: string): void {
+        this.cloudIds.set(serverId, { id, key: `${target.url}|${target.token ?? ""}`, at: Date.now() });
     }
 
     private async get(serverId: string, target: McpTarget): Promise<Client> {

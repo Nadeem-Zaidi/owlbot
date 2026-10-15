@@ -20,6 +20,8 @@ export function createStudioRouter(studio: StudioService): Router {
     const id = (req: Request) => String(req.params.id);
     r.get("/", h(async (req, res) => res.json({ projects: await studio.list(uid(req)) })));
     r.post("/", h(async (req, res) => res.status(201).json(await studio.save(uid(req), null, req.body))));
+    // One agent with sample input, as set up on the canvas (nothing saved).
+    r.post("/test-step", h(async (req, res) => res.json(await studio.testStep(uid(req), req.body))));
     r.get("/:id", h(async (req, res) => res.json(await studio.get(uid(req), id(req)))));
     r.put("/:id", h(async (req, res) => res.json(await studio.save(uid(req), id(req), req.body))));
     r.delete("/:id", h(async (req, res) => res.json(await studio.remove(uid(req), id(req)))));
