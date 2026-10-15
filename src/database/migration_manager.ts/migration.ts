@@ -1029,6 +1029,118 @@ export const migration_20261018100000: Migration = {
 };
 
 
+export const migration_20261019100000: Migration = {
+  version: "20261019100000",
+  description: "Agent Studio: visual projects that build real agents and run them as a workflow, with triggers",
+  up: [
+    // The canvas (agents + their model/tools/knowledge/skills + flow steps)
+    // compiles into a hidden pipeline (pipeline_id) that does the running.
+    `CREATE TABLE IF NOT EXISTS studio_projects (
+      id                TEXT PRIMARY KEY,
+      user_id           TEXT NOT NULL,
+      name              TEXT NOT NULL,
+      description       TEXT NOT NULL DEFAULT '',
+      canvas            JSONB NOT NULL,
+      pipeline_id       TEXT REFERENCES pipelines(id) ON DELETE SET NULL,
+      trigger_type      TEXT NOT NULL DEFAULT 'manual' CHECK (trigger_type IN ('manual', 'schedule', 'webhook', 'chat')),
+      chat_command      TEXT,
+      deliver_result    BOOLEAN NOT NULL DEFAULT false,
+      webhook_hash      TEXT UNIQUE,
+      webhook_secret    TEXT,
+      next_run_at       TIMESTAMPTZ,
+      last_triggered_at TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_studio_projects_user ON studio_projects(user_id, updated_at DESC)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_studio_projects_command ON studio_projects(user_id, chat_command) WHERE chat_command IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_studio_projects_due ON studio_projects(next_run_at) WHERE trigger_type = 'schedule'`,
+    `CREATE INDEX IF NOT EXISTS idx_studio_projects_pipeline ON studio_projects(pipeline_id)`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS studio_projects`,
+  ]
+};
+
+
+export const migration_20261020100000: Migration = {
+  version: "20261020100000",
+  description: "Reminders, to-dos and web watchers, with an alerts inbox",
+  up: [
+    // A task with remind_at is a reminder (sent to the user's phone); without, a to-do.
+    `CREATE TABLE IF NOT EXISTS tasks (
+      id               TEXT PRIMARY KEY,
+      user_id          TEXT NOT NULL,
+      title            TEXT NOT NULL,
+      notes            TEXT NOT NULL DEFAULT '',
+      status           TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done', 'cancelled')),
+      remind_at        TIMESTAMPTZ,
+      repeat           TEXT NOT NULL DEFAULT 'none' CHECK (repeat IN ('none', 'daily', 'weekdays', 'weekly', 'monthly', 'yearly')),
+      timezone         TEXT NOT NULL DEFAULT 'UTC',
+      anchor_day       INTEGER,
+      last_reminded_at TIMESTAMPTZ,
+      source           TEXT NOT NULL DEFAULT 'web',
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      completed_at     TIMESTAMPTZ
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id, status, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(remind_at) WHERE status = 'open' AND remind_at IS NOT NULL`,
+
+    // Pages checked on a schedule: alert on change, or when an AI condition becomes true.
+    `CREATE TABLE IF NOT EXISTS web_watchers (
+      id               TEXT PRIMARY KEY,
+      user_id          TEXT NOT NULL,
+      name             TEXT NOT NULL,
+      url              TEXT NOT NULL,
+      mode             TEXT NOT NULL DEFAULT 'change' CHECK (mode IN ('change', 'ai')),
+      condition        TEXT NOT NULL DEFAULT '',
+      interval_minutes INTEGER NOT NULL DEFAULT 360,
+      status           TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
+      next_check_at    TIMESTAMPTZ,
+      last_checked_at  TIMESTAMPTZ,
+      last_hash        TEXT,
+      last_text        TEXT,
+      last_match       BOOLEAN,
+      last_result      TEXT,
+      last_alert_at    TIMESTAMPTZ,
+      last_error       TEXT,
+      fail_count       INTEGER NOT NULL DEFAULT 0,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_web_watchers_user ON web_watchers(user_id, created_at DESC)`,
+    `CREATE INDEX IF NOT EXISTS idx_web_watchers_due ON web_watchers(next_check_at) WHERE status = 'active'`,
+
+    // Everything that was sent (or shown in the app when no phone is linked).
+    `CREATE TABLE IF NOT EXISTS automation_alerts (
+      id            BIGSERIAL PRIMARY KEY,
+      user_id       TEXT NOT NULL,
+      kind          TEXT NOT NULL CHECK (kind IN ('reminder', 'watcher')),
+      ref_id        TEXT,
+      title         TEXT NOT NULL,
+      body          TEXT NOT NULL DEFAULT '',
+      delivered_via TEXT NOT NULL DEFAULT 'app',
+      read_at       TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_automation_alerts_user ON automation_alerts(user_id, created_at DESC)`,
+
+    `CREATE TABLE IF NOT EXISTS automation_settings (
+      user_id    TEXT PRIMARY KEY,
+      timezone   TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS automation_settings`,
+    `DROP TABLE IF EXISTS automation_alerts`,
+    `DROP TABLE IF EXISTS web_watchers`,
+    `DROP TABLE IF EXISTS tasks`,
+  ]
+};
+
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -1056,5 +1168,7 @@ export const migrations: Migration[] = [
   migration_20261015100000,
   migration_20261016100000,
   migration_20261017100000,
-  migration_20261018100000
+  migration_20261018100000,
+  migration_20261019100000,
+  migration_20261020100000
 ];

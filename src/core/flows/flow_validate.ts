@@ -1,9 +1,17 @@
-import { Branch, Flow, FlowEdge, FlowNode, RuleOp } from "./flow_types";
-import { safeRegex } from "./flow_rules";
+import { Branch, Flow, FlowEdge, FlowNode, Route, Rule, RuleOp } from "./flow_types";
+import { FIELD_RE, firstNumber, listValues, numberRange, safeRegex } from "./flow_rules";
 
 export const MAX_FLOW_NODES = 30;
+export const MAX_ROUTES = 10;
+export const MAX_RULES_PER_ROUTE = 10;
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
-const RULE_OPS: RuleOp[] = ["contains", "not_contains", "equals", "matches", "number_gt", "number_gte", "number_lt", "number_lte", "is_empty", "not_empty"];
+const BRANCH_RE = /^(true|false|approved|rejected|default|route:[A-Za-z0-9_-]{1,40})$/;
+const RULE_OPS: RuleOp[] = [
+    "contains", "not_contains", "equals", "matches", "starts_with", "ends_with", "one_of",
+    "number_gt", "number_gte", "number_lt", "number_lte", "number_between",
+    "is_empty", "not_empty", "exists", "not_exists",
+];
+const NO_VALUE: RuleOp[] = ["is_empty", "not_empty", "exists", "not_exists"];
 
 export class FlowError extends Error {
     constructor(message: string, public status = 400) {
@@ -18,6 +26,48 @@ const text = (v: unknown, max: number, what: string, required = false) => {
     return s;
 };
 const num = (v: unknown) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : 0);
+
+// One rule: a known operator, a value it can use, and an optional JSON field.
+function validateRule(r: any, where: string): Rule {
+    const op = r?.op as RuleOp;
+    if (!RULE_OPS.includes(op)) throw new FlowError(`${where}: choose a rule`);
+    const field = text(r?.field, 100, `${where} field`);
+    if (field && !FIELD_RE.test(field)) throw new FlowError(`${where}: "${field}" isn't a valid field — use names like status, order.total or items[0].sku`);
+    if ((op === "exists" || op === "not_exists") && !field) throw new FlowError(`${where}: "exists" needs a JSON field to check`);
+    const value = NO_VALUE.includes(op) ? "" : text(r?.value, 500, `${where} value`);
+    if (!NO_VALUE.includes(op) && !value) throw new FlowError(`${where}: enter a value for the rule`);
+    if (op === "matches" && !safeRegex(value)) throw new FlowError(`${where}: that pattern isn't allowed (too long, invalid, or too slow)`);
+    if (op.startsWith("number_") && op !== "number_between" && firstNumber(value) === null) throw new FlowError(`${where}: enter a number to compare with`);
+    if (op === "number_between" && !numberRange(value)) throw new FlowError(`${where}: enter a range like 100..500 (lowest first)`);
+    if (op === "one_of" && !listValues(value).length) throw new FlowError(`${where}: list the values, separated by commas`);
+    return field ? { field, op, value } : { op, value };
+}
+
+function validateRoutes(raw: unknown, mode: "rule" | "ai", name: string): Route[] {
+    const list = Array.isArray(raw) ? raw : [];
+    if (!list.length) throw new FlowError(`${name}: add at least one route`);
+    if (list.length > MAX_ROUTES) throw new FlowError(`${name}: at most ${MAX_ROUTES} routes`);
+    const ids = new Set<string>(), labels = new Set<string>();
+    return list.map((r: any, i: number) => {
+        const id = String(r?.id ?? "");
+        if (!ID_RE.test(id) || ids.has(id)) throw new FlowError(`${name}: route ${i + 1} has an invalid or duplicate id`);
+        ids.add(id);
+        const label = text(r?.label, 40, `${name} route ${i + 1} name`, true);
+        const key = label.toLowerCase();
+        if (key === "otherwise" || key === "none") throw new FlowError(`${name}: "${label}" is reserved — pick another route name`);
+        if (labels.has(key)) throw new FlowError(`${name}: two routes are called "${label}"`);
+        labels.add(key);
+        const where = `${name} → ${label}`;
+        if (mode === "ai") {
+            const description = text(r?.description, 300, `${where} description`);
+            return { id, label, when: { match: "all", rules: [] }, ...(description ? { description } : {}) };
+        }
+        const rules = Array.isArray(r?.when?.rules) ? r.when.rules : [];
+        if (!rules.length) throw new FlowError(`${where}: add at least one rule`);
+        if (rules.length > MAX_RULES_PER_ROUTE) throw new FlowError(`${where}: at most ${MAX_RULES_PER_ROUTE} rules`);
+        return { id, label, when: { match: r?.when?.match === "any" ? "any" : "all", rules: rules.map((x: any) => validateRule(x, where)) } };
+    });
+}
 
 // Checks and normalizes a workflow from the editor. `agentExists` confirms
 // each agent step points at one of the user's agents.
@@ -52,13 +102,18 @@ export async function validateFlow(raw: any, agentExists: (kind: "agent" | "nati
                 if (n.mode === "ai") {
                     nodes.push({ id, type: "condition", position, label, mode: "ai", source, question: text(n.question, 500, `"${name}" question`, true) });
                 } else {
-                    const op = n.op as RuleOp;
-                    if (!RULE_OPS.includes(op)) throw new FlowError(`"${name}": choose a rule`);
-                    const value = text(n.value, 500, `"${name}" value`);
-                    if (op === "matches" && !safeRegex(value)) throw new FlowError(`"${name}": that pattern isn't allowed (too long, invalid, or too slow)`);
-                    if (!["is_empty", "not_empty"].includes(op) && !value) throw new FlowError(`"${name}": enter a value for the rule`);
-                    nodes.push({ id, type: "condition", position, label, mode: "rule", source, op, value });
+                    const rule = validateRule(n, `"${name}"`);
+                    nodes.push({ id, type: "condition", position, label, mode: "rule", source, ...rule });
                 }
+                break;
+            }
+            case "router": {
+                const source = text(n.source, 60, `"${name}" source`) || "previous";
+                if (!/^(previous|input|node\.[A-Za-z0-9_-]{1,40})$/.test(source)) throw new FlowError(`"${name}": unknown source "${source}"`);
+                const mode = n.mode === "ai" ? "ai" : "rule";
+                const routes = validateRoutes(n.routes, mode, `"${name}"`);
+                const instructions = mode === "ai" ? text(n.instructions, 1000, `"${name}" instructions`) : "";
+                nodes.push({ id, type: "router", position, label, mode, source, routes, ...(instructions ? { instructions } : {}) });
                 break;
             }
             case "approval":
@@ -85,7 +140,7 @@ export async function validateFlow(raw: any, agentExists: (kind: "agent" | "nati
         const from = String(e?.from ?? ""), to = String(e?.to ?? "");
         if (!byId.has(from) || !byId.has(to)) throw new FlowError("A connection points to a step that doesn't exist");
         if (from === to) throw new FlowError("A step can't connect to itself");
-        const branch = ["true", "false", "approved", "rejected"].includes(e?.branch) ? (e.branch as Branch) : undefined;
+        const branch = typeof e?.branch === "string" && BRANCH_RE.test(e.branch) ? (e.branch as Branch) : undefined;
         const key = `${from}:${branch ?? ""}`;
         if (seen.has(key)) throw new FlowError(`"${byId.get(from)!.label ?? from}" has two connections for the same outcome`);
         seen.add(key);
@@ -101,6 +156,13 @@ export async function validateFlow(raw: any, agentExists: (kind: "agent" | "nati
             if (out.length) throw new FlowError(`${name}: End can't continue to another step`);
         } else if (n.type === "condition") {
             if (!(branches.includes("true") && branches.includes("false") && out.length === 2)) throw new FlowError(`${name}: connect both the Yes and the No outcome`);
+        } else if (n.type === "router") {
+            // Every route and Otherwise lead somewhere, so no run can dead-end.
+            const expected = [...n.routes.map((r) => `route:${r.id}`), "default"];
+            const missing = n.routes.find((r) => !branches.includes(`route:${r.id}`));
+            if (missing) throw new FlowError(`${name}: connect the "${missing.label}" route`);
+            if (!branches.includes("default")) throw new FlowError(`${name}: connect the Otherwise route`);
+            if (out.some((e) => !expected.includes(e.branch ?? ""))) throw new FlowError(`${name}: a connection belongs to a route that was removed — delete it`);
         } else if (n.type === "approval") {
             if (!branches.includes("approved") || out.some((e) => e.branch !== "approved" && e.branch !== "rejected")) throw new FlowError(`${name}: connect the Approved outcome (Rejected is optional)`);
         } else if (out.length !== 1 || out[0].branch) {

@@ -24,6 +24,14 @@ export type ChatBridgeDeps = {
     agents?: AgentDirectory;
     // Loads a generated Word/Excel file so it can be sent as an attachment.
     files?: (userId: string, fileId: string) => Promise<{ buffer: Buffer; filename: string; mime: string }>;
+    // Agent Studio projects started by a command ("/triage <text>").
+    commands?: ChatCommands;
+};
+
+export type ChatCommands = {
+    list(userId: string): Promise<{ command: string; name: string }[]>;
+    // null when the user has no project with that command.
+    run(userId: string, command: string, input: string): Promise<{ name: string; deliver: boolean } | null>;
 };
 
 const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
@@ -81,6 +89,7 @@ export class ChatBridge {
             "/explain 2 — detailed walkthrough of a document",
             "/model — switch between ChatGPT and Claude",
             ...(this.deps.agents ? ["/agents — chat with one of your agents"] : []),
+            ...(this.deps.commands ? ["/flows — your Agent Studio commands"] : []),
             `/unlink — disconnect this ${this.adapter.id === "whatsapp" ? "number" : "chat"}`,
             "",
             "Send a PDF or document to add it to your knowledge base. Send a photo to ask about it.",
@@ -236,9 +245,36 @@ export class ChatBridge {
                 await this.deps.links.unlinkChat(chatId);
                 return this.reply(chatId, `This ${this.adapter.id === "whatsapp" ? "number" : "chat"} has been unlinked. Connect it again any time from Owl Bot on the web.`);
 
+            case "/flows":
+                if (this.deps.commands) return this.listFlows(link);
+                return this.reply(chatId, `I don't know that command.\n\n${this.help}`);
+
             default:
+                if (this.deps.commands && (await this.runFlow(link, cmd.slice(1), arg))) return;
                 return this.reply(chatId, `I don't know that command.\n\n${this.help}`);
         }
+    }
+
+    private async listFlows(link: ChannelLink): Promise<void> {
+        const list = await this.deps.commands!.list(link.userId);
+        if (!list.length) return this.reply(link.chatId, "You have no Agent Studio commands yet. In Owl Bot → **Agent Studio**, set a project's trigger to a chat command.");
+        const lines = list.map((c) => `/${c.command} — ${c.name}`);
+        return this.reply(link.chatId, `⚡ **Your commands**\n${lines.join("\n")}\n\nSend the command followed by your text, e.g. /${list[0].command} <your text>.`);
+    }
+
+    // True when the command belongs to one of the user's Agent Studio projects.
+    private async runFlow(link: ChannelLink, command: string, input: string): Promise<boolean> {
+        if (!/^[a-z][a-z0-9_]{1,30}$/.test(command)) return false;
+        try {
+            const started = await this.deps.commands!.run(link.userId, command, input);
+            if (!started) return false;
+            await this.reply(link.chatId, started.deliver
+                ? `▶️ Started **${started.name}**. I'll send the result here when it's done.`
+                : `▶️ Started **${started.name}**. See the result in Owl Bot → **Agent Studio**.`);
+        } catch (err) {
+            await this.reply(link.chatId, `⚠️ Couldn't start /${command}: ${err instanceof Error ? err.message : "something went wrong"}`);
+        }
+        return true;
     }
 
     private async explain(link: ChannelLink, arg: string): Promise<void> {

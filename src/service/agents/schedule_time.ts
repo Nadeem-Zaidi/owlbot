@@ -22,7 +22,7 @@ export function isValidTimezone(tz: string): boolean {
 }
 
 // Wall-clock parts of `date` as seen in `tz`.
-function partsIn(date: Date, tz: string) {
+export function partsIn(date: Date, tz: string) {
     const fmt = new Intl.DateTimeFormat("en-US", {
         timeZone: tz, hourCycle: "h23",
         year: "numeric", month: "numeric", day: "numeric",
@@ -41,7 +41,7 @@ function offsetMs(date: Date, tz: string): number {
 
 // The UTC instant when the clock in `tz` reads the given wall time. For a
 // time skipped by a DST jump it lands just after the jump.
-function zonedToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string): Date {
+export function zonedToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string): Date {
     const guess = Date.UTC(year, month - 1, day, hour, minute);
     const first = guess - offsetMs(new Date(guess), tz);
     const second = guess - offsetMs(new Date(first), tz);

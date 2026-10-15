@@ -130,6 +130,12 @@ export class AgentService {
         servers.forEach((s) => this.mcpPool.drop(s.id));
     }
 
+    // Checks an agent body without saving it (Agent Studio validates every
+    // agent on its canvas before writing any of them).
+    async checkInput(userId: string, body: any): Promise<void> {
+        await this.validateAgent(userId, body);
+    }
+
     private async requireAgent(userId: string, id: string): Promise<AgentRow> {
         const agent = await this.deps.repo.getAgent(id, userId);
         if (!agent) throw new AgentError("Agent not found", 404);

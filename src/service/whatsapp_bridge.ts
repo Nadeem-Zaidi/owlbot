@@ -6,7 +6,7 @@ import { KnowledgeBase } from "./knowledge_base";
 import { MessageService } from "./message_service";
 import { ModelRegistry } from "./model_registry";
 import { AgentRuntime } from "../core/runtime";
-import { ChatBridge } from "../channels/core/chat_bridge";
+import { ChatBridge, ChatCommands } from "../channels/core/chat_bridge";
 import { AgentDirectory } from "../channels/core/chat_adapter";
 import { WhatsAppAdapter, whatsappLinkStore } from "../channels/whatsapp_adapter";
 
@@ -25,6 +25,7 @@ type BridgeDeps = {
     runtime?: AgentRuntime;
     agents?: AgentDirectory;
     files?: (userId: string, fileId: string) => Promise<{ buffer: Buffer; filename: string; mime: string }>;
+    commands?: ChatCommands;
 };
 
 // WhatsApp on top of the generic ChatBridge (linking, commands, documents,
@@ -46,6 +47,7 @@ export class WhatsAppBridge extends ChatBridge {
             runtime: deps.runtime,
             agents: deps.agents,
             files: deps.files,
+            commands: deps.commands,
         });
         this.channel = deps.channel;
         this.repo = deps.repo;

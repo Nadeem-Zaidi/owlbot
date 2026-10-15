@@ -37,6 +37,14 @@ import { AgentRoutes } from "./routes/agent_routes";
 import { PipelineRepository } from "./repository/pipeline_repository";
 import { PipelineService } from "./service/agents/pipeline_service";
 import { PipelineRoutes } from "./routes/pipeline_routes";
+import { StudioRepository } from "./repository/studio_repository";
+import { StudioService } from "./core/studio/studio_service";
+import { createStudioHookRouter, createStudioRouter } from "./routes/studio_routes";
+import type { ChatCommands } from "./channels/core/chat_bridge";
+import { AutomationRepository } from "./repository/automation_repository";
+import { AutomationDeps, AutomationService } from "./core/automations/automation_service";
+import { createAutomationTools } from "./core/automations/automation_tools";
+import { createAutomationRouter } from "./routes/automation_routes";
 import { UsageRepository } from "./repository/usage_repository";
 import { UsageTrackingLLM } from "./llms/usage_tracking";
 import { SearchRepository } from "./repository/search_repository";
@@ -161,6 +169,12 @@ async function wa() {
     const documentTools = createDocumentTools(documentService);
     for (const t of documentTools) toolRegistry.registerBuiltin(t);
     const loadGeneratedFile = (userId: string, id: string) => documentService.load(userId, id);
+    // Reminders, to-dos and web watchers ("remind me…", "tell me when…").
+    // Phone delivery and AI checks are connected below, once they exist.
+    const automationDeps: AutomationDeps = { repo: new AutomationRepository(db), defaultTimezone: process.env.DEFAULT_TIMEZONE || "Asia/Kolkata" };
+    const automationService = new AutomationService(automationDeps);
+    const automationTools = createAutomationTools(automationService);
+    for (const t of automationTools) toolRegistry.registerBuiltin(t);
     const { providers, defaultProvider } = LLMFactory.createAllFromEnv(chatMessageService, toolRegistry, s3Client);
     // Record token usage for every chat turn, whichever feature started it.
     const usageRepo = new UsageRepository(db);
@@ -207,7 +221,7 @@ async function wa() {
         embed,
         usage: usageRepo,
         registry: modelRegistry,
-        alwaysTools: [...artifactTools, ...chartTools, ...memoryTools, ...skillTools, ...documentTools],
+        alwaysTools: [...artifactTools, ...chartTools, ...memoryTools, ...skillTools, ...documentTools, ...automationTools],
     });
     // Provider-native agents (Claude Managed Agents / OpenAI Agents API), for
     // each provider that has an API key.
@@ -264,6 +278,13 @@ async function wa() {
             return session.id;
         },
     };
+    // Agent Studio commands ("/triage …") in WhatsApp and Telegram. The
+    // service is created further down (it needs the workflow engine).
+    let studioService: StudioService | null = null;
+    const studioCommands: ChatCommands = {
+        list: async (userId) => (studioService ? studioService.commands(userId) : []),
+        run: async (userId, command, input) => (studioService ? studioService.runCommand(userId, command, input) : null),
+    };
     const whatsappRepo = new WhatsAppRepository(db);
     const settingsService = new SettingsService(new SettingsRepository(db));
     await settingsService.seedFromEnv();
@@ -281,6 +302,7 @@ async function wa() {
             runtime,
             agents: agentDirectory,
             files: loadGeneratedFile,
+            commands: studioCommands,
         }),
     });
     await whatsappManager.init();
@@ -302,6 +324,7 @@ async function wa() {
             runtime,
             agents: agentDirectory,
             files: loadGeneratedFile,
+            commands: studioCommands,
         }),
     });
     await telegramManager.init();
@@ -355,6 +378,26 @@ async function wa() {
     await pipelineService.init();
     const pipelineRoutes = new PipelineRoutes(pipelineService);
 
+    // Reminders reach the user's WhatsApp, else Telegram (else the in-app
+    // inbox); AI watchers ask the user's default model in a throwaway chat.
+    automationDeps.notify = notifyLinkedApp;
+    automationDeps.askModel = async (userId, prompt, signal) => {
+        const session = await chatMessageService.createSession(userId, "pipeline", "👀 Web watcher check");
+        try {
+            const r = await runtime.runToText({
+                channel: "pipeline", userId, sessionId: session.id, input: { type: "message", role: "user", content: [{ type: "text", text: prompt }] },
+            }, signal);
+            return { text: r.text, error: r.error ?? (r.cancelled ? "timed out" : null) };
+        } finally {
+            await chatMessageService.deleteSession(session.id, userId).catch(() => {});
+        }
+    };
+    if (hostsJobs && process.env.SCHEDULER_ENABLED !== "false") automationService.start();
+
+    // Agent Studio: visual agent projects, run by the workflow engine.
+    studioService = new StudioService(new StudioRepository(db), agentRepo, agentService, pipelineService);
+    if (hostsJobs && process.env.SCHEDULER_ENABLED !== "false") studioService.start();
+
     const { searchRouter, usageRouter } = createInsightsRouters(new SearchRepository(db), usageRepo);
 
     const gateway = new VGateway(Number(process.env.PORT ?? 3000), db, chatRoutes, storageRoutes, whatsappRoutes, agentRoutes, pipelineRoutes, [
@@ -368,12 +411,16 @@ async function wa() {
         { path: "/api/skills", router: createSkillRouter(skillService) },
         { path: "/api/documents", router: createDocumentRouter(documentService) },
         { path: "/api/market", router: createMarketRouter(marketplace) },
+        { path: "/api/studio", router: createStudioRouter(studioService) },
+        { path: "/api/automations", router: createAutomationRouter(automationService) },
         { path: "/api/admin", router: createAdminRouter(settingsService, whatsappManager, { manager: telegramManager, verify: (t) => telegramBotInfo(t) }, { whatsapp: whatsappControl, telegram: telegramControl }) },
         { path: "/api/telegram", router: createTelegramRouter(chatMessageService, telegramLinks, telegramControl, settingsService) },
     ], [
         { path: "/api/billing/webhook", router: createBillingWebhookRouter(billing) },
         // Developer API (its own sk-owl-… keys, not the app login).
         { path: "/api/v1", router: createMarketApiRouter(marketplace) },
+        // Agent Studio webhook triggers (the token in the URL is the credential).
+        { path: "/api/studio-hooks", router: createStudioHookRouter(studioService) },
     ]);
     gateway.setStatus(() => ({ activeRuns: runtime.activeRuns(), busySessions: runtime.lanes.activeSessions() }));
     registerGauge("owl_active_turns", "Chat turns running in this process", () => runtime.activeRuns());
@@ -395,6 +442,8 @@ async function wa() {
         stopping = true;
         console.log(`[app] ${signal} — shutting down`);
         agentScheduler.stop();
+        studioService?.stop();
+        automationService.stop();
         channelHub.stop();
         await whatsappManager.stop().catch(() => {});
         await telegramManager.stop().catch(() => {});

@@ -67,7 +67,10 @@ export class PipelineRepository {
             `SELECT p.*,
                     (SELECT status FROM pipeline_runs r WHERE r.pipeline_id = p.id ORDER BY r.started_at DESC LIMIT 1) AS last_run_status,
                     (SELECT started_at FROM pipeline_runs r WHERE r.pipeline_id = p.id ORDER BY r.started_at DESC LIMIT 1) AS last_run_at
-             FROM pipelines p WHERE p.user_id = $1 ORDER BY p.updated_at DESC`,
+             FROM pipelines p WHERE p.user_id = $1
+               -- Agent Studio's compiled workflows are shown in the Studio, not here.
+               AND NOT EXISTS (SELECT 1 FROM studio_projects s WHERE s.pipeline_id = p.id)
+             ORDER BY p.updated_at DESC`,
             [userId]
         );
         return rows;

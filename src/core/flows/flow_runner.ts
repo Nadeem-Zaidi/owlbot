@@ -5,8 +5,8 @@ import { AgentService } from "../../service/agents/agent_service";
 import { MessageService } from "../../service/message_service";
 import { NativeAgentService } from "../../service/native_agents/native_agent_service";
 import { metrics } from "../../infra/observability";
-import { conditionSource, evaluateRule, parseYesNo, renderTemplate } from "./flow_rules";
-import { Branch, Flow, FlowNode, FlowRunState, FlowTraceEntry } from "./flow_types";
+import { conditionSource, evaluateGroup, evaluateOne, parseRoutePick, parseYesNo, renderTemplate, RuleSubject } from "./flow_rules";
+import { Branch, Flow, FlowNode, FlowRunState, FlowTraceEntry, Route } from "./flow_types";
 
 const STEP_TIMEOUT_MS = 5 * 60_000;
 const MAX_TEXT_CHARS = 50_000;     // what one step may hand to the next
@@ -99,7 +99,7 @@ export class FlowRunner {
                         let result: boolean;
                         let detail: string;
                         if (node.mode === "rule") {
-                            ({ result, detail } = evaluateRule(subject, node.op, node.value));
+                            ({ result, detail } = evaluateOne(new RuleSubject(subject), { field: node.field, op: node.op, value: node.value }));
                         } else {
                             if (!this.deps.askModel) throw new FlowStop("AI conditions aren't available on this server");
                             await save();
@@ -114,6 +114,34 @@ export class FlowRunner {
                         const branch: Branch = result ? "true" : "false";
                         Object.assign(entry, { status: "succeeded", branch, output: `${result ? "Yes" : "No"} — ${detail}`, finished_at: now() });
                         state.current = next(node.id, branch);
+                        break;
+                    }
+
+                    case "router": {
+                        const subject = conditionSource(node.source, state.input, state.previous, state.outputs);
+                        let route: Route | null = null;
+                        let detail: string;
+                        if (node.mode === "rule") {
+                            // Routes are checked top to bottom; the first match wins.
+                            const s = new RuleSubject(subject);
+                            const checked: string[] = [];
+                            for (const r of node.routes) {
+                                const res = evaluateGroup(s, r.when);
+                                checked.push(`${r.label}: ${res.detail}`);
+                                if (res.result) { route = r; break; }
+                            }
+                            detail = checked.join("\n");
+                        } else {
+                            await save();
+                            ({ route, detail } = await this.pickRoute(userId, pipelineName, entry.label, node, subject, state));
+                        }
+                        const branch: Branch = route ? `route:${route.id}` : "default";
+                        const label = route?.label ?? "Otherwise";
+                        Object.assign(entry, { status: "succeeded", branch, branch_label: label, output: `→ ${label}\n\n${detail}`.slice(0, 4000), finished_at: now() });
+                        // {{node.<router id>}} = the route it took.
+                        state.outputs[node.id] = label;
+                        state.current = next(node.id, branch);
+                        if (!state.current) throw new FlowStop(`"${entry.label}": the "${label}" route isn't connected`);
                         break;
                     }
 
@@ -164,6 +192,29 @@ export class FlowRunner {
         }
     }
 
+    // AI routing: the model names one route (or NONE). A model/network error
+    // is retried once and then fails the step — a silent misroute is worse
+    // than a visible failure. An unclear answer takes Otherwise.
+    private async pickRoute(userId: string, pipelineName: string, stepLabel: string, node: Extract<FlowNode, { type: "router" }>, subject: string, state: FlowRunState): Promise<{ route: Route | null; detail: string }> {
+        if (!this.deps.askModel) throw new FlowStop("AI routing isn't available on this server");
+        const options = node.routes.map((r, i) => `${i + 1}. ${r.label}${r.description ? ` — ${r.description}` : ""}`).join("\n");
+        const extra = node.instructions ? `\n\nGuidance: ${renderTemplate(node.instructions, state.input, state.previous, state.outputs)}` : "";
+        const prompt = [
+            "You are the router in an automated workflow. Read the text and choose the ONE route that fits it best.",
+            `Routes:\n${options}`,
+            `If no route clearly fits, answer NONE.${extra}`,
+            "Reply with only the route name, exactly as written above — no explanation.",
+            `Text:\n"""\n${subject.slice(0, 20_000)}\n"""`,
+        ].join("\n\n");
+        const session = await this.deps.messageService.createSession(userId, "pipeline", `🔀 ${pipelineName} · ${stepLabel}`);
+        let r = await this.deps.askModel(userId, session.id, prompt, AbortSignal.timeout(STEP_TIMEOUT_MS));
+        if (r.error) r = await this.deps.askModel(userId, session.id, prompt, AbortSignal.timeout(STEP_TIMEOUT_MS));
+        if (r.error) throw new FlowStop(`"${stepLabel}": the AI couldn't choose a route (${r.error})`);
+        const answer = r.text.trim().slice(0, 200);
+        const route = parseRoutePick(answer, node.routes);
+        return { route, detail: route ? `AI chose "${route.label}"` : `AI answered "${answer || "nothing"}" — no route matched, so Otherwise` };
+    }
+
     // Records an approval decision on a run that was claimed (status →
     // running) and moves state.current to the chosen branch. Returns false
     // when "rejected" has nowhere to go (the run ends as rejected).
@@ -188,5 +239,5 @@ function renderInstruction(instruction: string, state: FlowRunState): string {
 }
 
 function defaultLabel(n: FlowNode): string {
-    return { start: "Start", agent: "Agent", condition: "Condition", approval: "Approval", notify: "Notify", end: "End" }[n.type];
+    return { start: "Start", agent: "Agent", condition: "Condition", router: "Router", approval: "Approval", notify: "Notify", end: "End" }[n.type];
 }

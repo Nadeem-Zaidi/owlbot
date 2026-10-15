@@ -31,6 +31,20 @@ export function apiRateLimit(): RequestHandler {
     });
 }
 
+// Public webhooks that start an Agent Studio run: limited per webhook URL
+// (each run costs model calls), so a leaked URL can't run up a bill.
+export function webhookRateLimit(): RequestHandler {
+    return rateLimit({
+        windowMs: 60_000,
+        limit: num("STUDIO_WEBHOOK_PER_MINUTE", 20),
+        keyGenerator: (req) => `hook:${String(req.params.token ?? "").slice(-24)}`,
+        standardHeaders: "draft-8",
+        legacyHeaders: false,
+        store: store("hook"),
+        message: { message: "Too many calls to this webhook — try again in a minute." },
+    });
+}
+
 // Model calls are the expensive part (seconds and real money each), so they
 // get their own, much lower limit.
 export function chatRateLimit(): RequestHandler {
