@@ -270,6 +270,8 @@ export function buildAgentToolSet(
     deps: BuiltinDeps,
     pool: McpPool,
     codeFunctions: AgentCodeFunctionRow[] = [],
+    // Other agents this one can ask (ask_… tools).
+    helpers: ToolDefinition[] = [],
 ): AgentToolSet {
     const tools: ToolDefinition[] = [];
     for (const id of agent.builtin_tools) {
@@ -279,6 +281,7 @@ export function buildAgentToolSet(
     for (const fn of functions) if (fn.enabled) tools.push(httpFunctionTool(fn));
     for (const fn of codeFunctions) if (fn.enabled) tools.push(codeFunctionTool(fn));
     for (const s of servers) tools.push(...mcpTools(s, pool));
+    tools.push(...helpers);
     tools.push(...(deps.alwaysTools ?? []));
     return new AgentToolSet(tools);
 }

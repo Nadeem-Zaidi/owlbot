@@ -11,6 +11,7 @@ import { IFileStore } from "../interfaces/ifilestore";
 import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
+import { needsTitle } from "./title_policy";
 
 
 
@@ -249,6 +250,11 @@ export class OpenAIProvider implements ILLM {
         const toolset: ToolSource = run?.tools ?? this.tools;
         await this.messageService.runTransaction(sessionId, messages);
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
+        // Title after the first exchange (or for a chat still untitled). Not by
+        // counting the model input: agent chats also carry their system prompt
+        // and tool calls, which used to skip the title.
+        const wantsTitle = await needsTitle(this.messageService, sessionId, userId, userSessionMessages);
+        let titleGenerated = false;
         // The context engine picks what part of the stored history is sent
         // (recent messages + a summary of older ones); everything stays stored.
         const context = await contextEngine().assemble(userSessionMessages, {
@@ -445,7 +451,8 @@ export class OpenAIProvider implements ILLM {
                                 };
                                 await this.messageService.createLLMMessage(sessionId, assistantMessage);
                                 inputMessages = [...inputMessages, ...this.fromInput([assistantMessage])];
-                                if ([1, 2, 3, 4].includes(inputMessages.length)) {
+                                if (wantsTitle && !titleGenerated) {
+                                    titleGenerated = true;
                                     const generated = await this.generateTitle(inputMessages);
                                     if (generated.usage) yield usageIncrement(generated.usage, generated.model, "title");
                                     const titleToUpdate = generated.title;

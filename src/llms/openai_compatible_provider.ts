@@ -9,6 +9,7 @@ import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
 import { assertPublicUrl } from "../service/agents/url_guard";
+import { needsTitle } from "./title_policy";
 
 // Any service that speaks OpenAI's Chat Completions API: OpenRouter, Groq,
 // DeepSeek, Mistral, Together, Fireworks, a local Ollama / LM Studio, …
@@ -247,7 +248,7 @@ export class OpenAICompatibleProvider implements ILLM {
             else history.unshift({ role: "system", content: run.systemPrompt });
         }
         let tools = this.toolDefinitions(toolset);
-        const isFirstExchange = stored.filter((m) => m.role === "user").length === 1;
+        const isFirstExchange = await needsTitle(this.messageService, sessionId, userId, stored);
         let titleDone = false;
         const sources = new Set<string>();
         let includeUsage = true;

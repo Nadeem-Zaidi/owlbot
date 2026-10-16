@@ -1141,6 +1141,18 @@ export const migration_20261020100000: Migration = {
 };
 
 
+export const migration_20261021100000: Migration = {
+  version: "20261021100000",
+  description: "Agents can ask other agents (helper agents, used as tools)",
+  up: [
+    `ALTER TABLE agents ADD COLUMN IF NOT EXISTS helper_agent_ids JSONB NOT NULL DEFAULT '[]'`,
+  ],
+  down: [
+    `ALTER TABLE agents DROP COLUMN IF EXISTS helper_agent_ids`,
+  ]
+};
+
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -1170,5 +1182,6 @@ export const migrations: Migration[] = [
   migration_20261017100000,
   migration_20261018100000,
   migration_20261019100000,
-  migration_20261020100000
+  migration_20261020100000,
+  migration_20261021100000
 ];

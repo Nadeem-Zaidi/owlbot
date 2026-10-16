@@ -45,6 +45,8 @@ import { AutomationRepository } from "./repository/automation_repository";
 import { AutomationDeps, AutomationService } from "./core/automations/automation_service";
 import { createAutomationTools } from "./core/automations/automation_tools";
 import { createAutomationRouter } from "./routes/automation_routes";
+import { PortableService } from "./core/portable/portable_service";
+import { createPortableRouter } from "./routes/portable_routes";
 import { UsageRepository } from "./repository/usage_repository";
 import { UsageTrackingLLM } from "./llms/usage_tracking";
 import { SearchRepository } from "./repository/search_repository";
@@ -413,6 +415,8 @@ async function wa() {
         { path: "/api/market", router: createMarketRouter(marketplace) },
         { path: "/api/studio", router: createStudioRouter(studioService) },
         { path: "/api/automations", router: createAutomationRouter(automationService) },
+        // Export / import agents and Agent Studio projects as JSON.
+        { path: "/api/portable", router: createPortableRouter(new PortableService({ agentRepo, agents: agentService, studio: studioService, skills: skillService, kb: knowledgeBase })) },
         { path: "/api/admin", router: createAdminRouter(settingsService, whatsappManager, { manager: telegramManager, verify: (t) => telegramBotInfo(t) }, { whatsapp: whatsappControl, telegram: telegramControl }) },
         { path: "/api/telegram", router: createTelegramRouter(chatMessageService, telegramLinks, telegramControl, settingsService) },
     ], [

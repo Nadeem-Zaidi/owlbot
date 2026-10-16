@@ -22,6 +22,17 @@ import { computeNextRun, describeTiming, validateTiming } from "./schedule_time"
 import { decryptSecret, encryptSecret, SECRET_MASK } from "./secrets";
 import { assertPublicUrl } from "./url_guard";
 import { collectReply } from "../../core/runtime/collect";
+import { AsyncLocalStorage } from "node:async_hooks";
+
+// Agents asking agents: the chain of agents working on the current request
+// (outermost first), so a helper can't send work back up (A → B → A) and
+// work can't be passed on more than MAX_HELPER_DEPTH levels.
+const helperChain = new AsyncLocalStorage<string[]>();
+const MAX_HELPERS = 5;                 // helper agents per agent
+const MAX_HELPER_DEPTH = 2;            // A → B → C, not further
+const MAX_HELPER_CALLS = 6;            // per reply
+const HELPER_TIMEOUT_MS = 180_000;
+const MAX_HELPER_ANSWER = 20_000;
 
 export class AgentError extends Error {
     constructor(message: string, public status = 400) {
@@ -119,6 +130,7 @@ export class AgentService {
 
     async update(userId: string, id: string, body: any): Promise<AgentRow> {
         await this.requireAgent(userId, id);
+        if (Array.isArray(body?.helper_agent_ids) && body.helper_agent_ids.includes(id)) throw new AgentError("An agent can't ask itself");
         const updated = await this.deps.repo.updateAgent(id, userId, await this.validateAgent(userId, body));
         if (!updated) throw new AgentError("Agent not found", 404);
         return updated;
@@ -188,7 +200,18 @@ export class AgentService {
             skill_ids = Array.isArray(b?.skill_ids) ? [...new Set<string>(b.skill_ids.filter((x: unknown) => typeof x === "string"))].slice(0, 100) : [];
         }
 
-        return { name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids };
+        // Helper agents: other agents of this user it may ask. Not sent → unchanged.
+        let helper_agent_ids: string[] | undefined;
+        if (b?.helper_agent_ids !== undefined) {
+            const ids = Array.isArray(b.helper_agent_ids) ? [...new Set<string>(b.helper_agent_ids.filter((x: unknown) => typeof x === "string"))] : [];
+            if (ids.length > MAX_HELPERS) throw new AgentError(`An agent can ask at most ${MAX_HELPERS} other agents`);
+            for (const id of ids) {
+                if (!(await this.deps.repo.getAgent(id, userId))) throw new AgentError("A helper agent wasn't found — pick from your agents");
+            }
+            helper_agent_ids = ids;
+        }
+
+        return { name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids, helper_agent_ids };
     }
 
     private validateInstructionFiles(raw: unknown): InstructionFile[] {
@@ -605,7 +628,8 @@ export class AgentService {
             this.deps.repo.listMcpServers(agent.id),
             codeFunctionsEnabled() ? this.deps.repo.listCodeFunctions(agent.id) : Promise.resolve([]),
         ]);
-        const tools = buildAgentToolSet(agent, functions, servers, { vectorDb: this.deps.vectorDb, embed: this.deps.embed, kb: this.deps.kb, alwaysTools: this.deps.alwaysTools }, this.mcpPool, codeFunctions);
+        const helpers = await this.helperTools(agent);
+        const tools = buildAgentToolSet(agent, functions, servers, { vectorDb: this.deps.vectorDb, embed: this.deps.embed, kb: this.deps.kb, alwaysTools: this.deps.alwaysTools }, this.mcpPool, codeFunctions, helpers);
         const docNames = agent.document_keys.map((k) => k.split("/").pop());
 
         // Attached .md files, each under its own heading, after the main instructions.
@@ -625,6 +649,68 @@ export class AgentService {
             systemPrompt, tools, codeInterpreter: agent.builtin_tools.includes("code_interpreter"),
             skillScope: { mode: agent.skill_mode ?? "all", ids: agent.skill_ids ?? [] },
         };
+    }
+
+    // One ask_<name> tool per helper agent. The helper runs with its own
+    // model, tools and MCP servers in a throwaway chat; its answer comes back
+    // as the tool result. Calls are capped per reply, and the chain of
+    // agents working on the request is tracked so work can't loop back or
+    // go deeper than MAX_HELPER_DEPTH.
+    private async helperTools(caller: AgentRow): Promise<ToolDefinition[]> {
+        const ids = (caller.helper_agent_ids ?? []).filter((id) => id !== caller.id);
+        if (!ids.length) return [];
+        let calls = 0;
+        const used = new Set<string>();
+        const tools: ToolDefinition[] = [];
+        for (const id of ids) {
+            const helper = await this.deps.repo.getAgent(id, caller.user_id);
+            if (!helper) continue;
+            const base = `ask_${helper.name.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 50) || "agent"}`;
+            let name = base;
+            for (let i = 2; used.has(name); i++) name = `${base}_${i}`;
+            used.add(name);
+            tools.push({
+                name,
+                description:
+                    `Ask your "${helper.name}" agent to do a task and get its answer back.${helper.description ? ` It: ${helper.description}` : ""} ` +
+                    "It has its own tools and does not see this conversation, so give it a complete, self-contained task with all the details it needs.",
+                parameters: {
+                    type: "object",
+                    properties: {
+                        task: { type: "string", description: "What it should do, with all the details it needs" },
+                        context: { type: "string", description: "Extra material it should use (optional), e.g. text from earlier in the conversation" },
+                    },
+                    required: ["task"],
+                },
+                execute: async (args) => {
+                    const task = String(args.task ?? "").trim();
+                    if (!task) throw new Error("Give the agent a task");
+                    const chain = helperChain.getStore() ?? [caller.id];
+                    if (chain.includes(helper.id)) throw new Error(`"${helper.name}" is already working on this request — asking it again would loop. Answer with what you have.`);
+                    if (chain.length > MAX_HELPER_DEPTH) throw new Error(`Work can only be passed on ${MAX_HELPER_DEPTH} levels deep. Answer with what you have.`);
+                    if (calls >= MAX_HELPER_CALLS) throw new Error(`Other agents were already asked ${MAX_HELPER_CALLS} times in this reply. Answer with what you have.`);
+                    calls++;
+                    const current = await this.deps.repo.getAgent(helper.id, caller.user_id);
+                    if (!current) throw new Error(`"${helper.name}" no longer exists`);
+                    const context = typeof args.context === "string" ? args.context.trim() : "";
+                    const prompt = context ? `${task}\n\n---\nContext:\n${context.slice(0, 50_000)}` : task;
+                    const session = await this.deps.messageService.createSession(caller.user_id, "pipeline", `🤖 ${caller.name} → ${current.name}`);
+                    try {
+                        const r = await helperChain.run([...chain, current.id], () =>
+                            this.runOnce(current, caller.user_id, session.id, prompt, AbortSignal.timeout(HELPER_TIMEOUT_MS)));
+                        if (!r.text) throw new Error(`"${current.name}" couldn't finish: ${r.error ?? "no answer"}`);
+                        return {
+                            agent: current.name,
+                            answer: r.text.length > MAX_HELPER_ANSWER ? `${r.text.slice(0, MAX_HELPER_ANSWER)}\n…[truncated]` : r.text,
+                            ...(r.error ? { note: r.error } : {}),
+                        };
+                    } finally {
+                        await this.deps.messageService.deleteSession(session.id, caller.user_id).catch(() => {});
+                    }
+                },
+            });
+        }
+        return tools;
     }
 
     async agentForSession(sessionId: string, userId: string, requestedAgentId?: string): Promise<AgentRow | null> {

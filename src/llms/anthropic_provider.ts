@@ -10,6 +10,7 @@ import { ToolDefinition } from "../types/type";
 import { contextEngine } from "../core/context";
 import { estimatedUsageIncrement, usageIncrement } from "./usage_tracking";
 import { TokenCounts } from "../repository/usage_repository";
+import { needsTitle } from "./title_policy";
 
 type MessageParam = Anthropic.Beta.BetaMessageParam;
 type ContentBlockParam = Anthropic.Beta.BetaContentBlockParam;
@@ -287,7 +288,7 @@ export class AnthropicProvider implements ILLM {
         const system = [run?.systemPrompt, storedSystem].filter(Boolean).join("\n\n");
         const tools = this.toolDefinitions(toolset);
 
-        const isFirstExchange = userSessionMessages.filter((m) => m.role === "user").length === 1;
+        const isFirstExchange = await needsTitle(this.messageService, sessionId, userId, userSessionMessages);
         let titleGenerated = false;
         const collectedSources = new Set<string>();
         let jsonRetries = 0;
