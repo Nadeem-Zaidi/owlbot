@@ -32,8 +32,10 @@ export class SkillIndexEngine implements ContextEngine {
 
 export function skillIndexPrompt(index: SkillIndexEntry[]): string {
     return [
-        "Skills you can load: the user's own instruction packs. When a task matches a skill's description, " +
-        "call load_skill with its name first and follow those instructions. Don't load skills that aren't relevant.",
+        "Skills you can load — the user's own expert instructions. Before answering, check this list: if the request " +
+        "matches a skill's description, call load_skill with its name first and follow those instructions " +
+        "(they take priority over your general knowledge). If a skill was already loaded in this conversation, use it. " +
+        "Don't load skills that aren't relevant.",
         ...index.map((s) => `- ${s.name}: ${s.description}`),
     ].join("\n");
 }

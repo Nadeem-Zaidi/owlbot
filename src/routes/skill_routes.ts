@@ -18,8 +18,15 @@ export function createSkillRouter(skills: SkillService): Router {
     r.get("/", h(async (req, res) => res.json({ skills: await skills.list(uid(req)) })));
     // { markdown, fileName? } — a SKILL.md with name/description front matter.
     r.post("/import", h(async (req, res) => res.status(201).json(await skills.importMarkdown(uid(req), req.body?.markdown, req.body?.fileName))));
+    // { zip: base64, fileName } — a whole skill folder (SKILL.md + files).
+    r.post("/import-zip", h(async (req, res) => res.status(201).json(await skills.importZip(uid(req), req.body?.zip, req.body?.fileName))));
     r.post("/", h(async (req, res) => res.status(201).json(await skills.create(uid(req), req.body))));
     r.get("/:id", h(async (req, res) => res.json(await skills.get(uid(req), String(req.params.id)))));
+    r.get("/:id/file", h(async (req, res) => res.json(await skills.file(uid(req), String(req.params.id), String(req.query.path ?? "")))));
+    r.delete("/:id/file", h(async (req, res) => {
+        await skills.deleteFile(uid(req), String(req.params.id), String(req.query.path ?? ""));
+        res.status(204).send();
+    }));
     r.put("/:id", h(async (req, res) => res.json(await skills.update(uid(req), String(req.params.id), req.body ?? {}))));
     r.delete("/:id", h(async (req, res) => {
         await skills.remove(uid(req), String(req.params.id));

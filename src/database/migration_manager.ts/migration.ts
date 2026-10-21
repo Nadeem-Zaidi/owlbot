@@ -1239,6 +1239,29 @@ export const migration_20261023100000: Migration = {
   ]
 };
 
+export const migration_20261024100000: Migration = {
+  version: "20261024100000",
+  description: "Skill folders: reference files bundled with a skill (from SKILL.md folders / .zip), plus license and source",
+  up: [
+    `CREATE TABLE IF NOT EXISTS skill_files (
+      skill_id    TEXT NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+      path        TEXT NOT NULL CHECK (length(path) BETWEEN 1 AND 200),
+      kind        TEXT NOT NULL CHECK (kind IN ('reference', 'script')),
+      content     TEXT NOT NULL,
+      bytes       INTEGER NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (skill_id, path)
+    )`,
+    `ALTER TABLE skills ADD COLUMN IF NOT EXISTS license TEXT`,
+    `ALTER TABLE skills ADD COLUMN IF NOT EXISTS source TEXT`,
+  ],
+  down: [
+    `ALTER TABLE skills DROP COLUMN IF EXISTS source`,
+    `ALTER TABLE skills DROP COLUMN IF EXISTS license`,
+    `DROP TABLE IF EXISTS skill_files`,
+  ]
+};
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -1271,5 +1294,6 @@ export const migrations: Migration[] = [
   migration_20261020100000,
   migration_20261021100000,
   migration_20261022100000,
-  migration_20261023100000
+  migration_20261023100000,
+  migration_20261024100000
 ];

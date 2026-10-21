@@ -118,6 +118,16 @@ export class VGateway {
         this.app.use("/api", this.chatRoutes.getRouter());
         this.storageRoutes.registerRouter();
         this.app.use("/",this.storageRoutes.getRouter());
+
+        // Last stop for errors a route didn't handle: log the details here,
+        // answer with plain JSON. (Express's built-in handler would send an
+        // HTML page with the stack trace and server file paths.)
+        this.app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+            if (res.headersSent) return next(err);
+            const status = Number(err?.status ?? err?.statusCode) || 500;
+            if (status >= 500) console.error(`[http] ${req.method} ${req.path} failed:`, err);
+            res.status(status).json({ message: status >= 500 ? "Something went wrong. Please try again." : err?.message ?? "Request failed" });
+        });
     }
 
     // Graceful shutdown: /readyz fails so the LB stops sending traffic, no new

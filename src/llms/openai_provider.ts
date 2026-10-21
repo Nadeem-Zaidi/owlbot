@@ -136,25 +136,18 @@ export class OpenAIProvider implements ILLM {
 
 
 
-                case "system":
-                    return {
-                        type: "message",
-                        role: "system",
-                        content: (m.content as ContentPart[]).map((msg) => {
-                            switch (msg.type) {
-                                case "input_text":
-                                    return {
-                                        type: "input_text",
-                                        text: (msg as TextContent).text
-                                    } as ResponseInputText;
-
-                                default:
-                                    throw new Error(
-                                        `Unsupported system content type: ${msg.type}`
-                                    );
-                            }
-                        })
-                    };
+                case "system": {
+                    // Instructions come from several places (stored system
+                    // prompt, the skill index, recalled memories) and use
+                    // "text" or "input_text"; anything that isn't text is
+                    // skipped rather than failing the whole request.
+                    const parts = typeof m.content === "string"
+                        ? [{ type: "input_text", text: m.content } as ResponseInputText]
+                        : (m.content as ContentPart[])
+                            .filter((msg) => ["text", "input_text", "output_text"].includes(msg.type) && typeof (msg as TextContent).text === "string")
+                            .map((msg) => ({ type: "input_text", text: (msg as TextContent).text }) as ResponseInputText);
+                    return { type: "message", role: "system", content: parts };
+                }
 
                 default:
                     return {
