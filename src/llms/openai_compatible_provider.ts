@@ -1,4 +1,5 @@
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
+import { ToolLoopGuard } from "./tool_loop_guard";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
 import { LLMConfig } from "../types/lmconfig";
@@ -27,7 +28,6 @@ type WireToolCall = { id: string; type: "function"; function: { name: string; ar
 
 const TITLE_PROMPT = "Write a short, specific title (4–8 words, Title Case, max 60 characters) for this conversation. Return only the title, no quotes.";
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
-const MAX_TOOL_ROUNDS = 12;
 
 export class ProviderHttpError extends Error {
     constructor(public status: number, message: string) {
@@ -254,10 +254,22 @@ export class OpenAICompatibleProvider implements ILLM {
         let includeUsage = true;
         let sendMaxTokens = true;
 
-        for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        // Ends runaway tool use with one final, tool-less answer.
+        const guard = new ToolLoopGuard();
+        let wrapUpSent = false;
+
+        for (;;) {
             if (signal.aborted) {
                 yield { type: "cancelled", content: [{ type: "aborted", text: "Request cancelled." }] };
                 return;
+            }
+            if (guard.shouldWrapUp) {
+                if (wrapUpSent) {
+                    yield { content: "", isDone: true, sources: sources.size ? [...sources] : undefined };
+                    return;
+                }
+                wrapUpSent = true;
+                history.push({ role: "system", content: guard.wrapUpInstruction() });
             }
             const body: Record<string, unknown> = {
                 model: activeModel,
@@ -266,6 +278,7 @@ export class OpenAICompatibleProvider implements ILLM {
                 ...(sendMaxTokens ? { max_tokens: this.config.maxTokens } : {}),
                 ...(includeUsage ? { stream_options: { include_usage: true } } : {}),
                 ...(tools.length ? { tools } : {}),
+                ...(wrapUpSent && tools.length ? { tool_choice: "none" } : {}),
             };
 
             let turn: { text: string; toolCalls: WireToolCall[]; finishReason: string | null; usage: TokenCounts | null; model: string | null; cost?: number };
@@ -282,11 +295,10 @@ export class OpenAICompatibleProvider implements ILLM {
                 // Some services reject parts of the request: retry once without them.
                 if (err instanceof ProviderHttpError && err.status === 400 && !streamed) {
                     const m = err.message.toLowerCase();
-                    if (includeUsage && m.includes("stream_options")) { includeUsage = false; round--; continue; }
-                    if (sendMaxTokens && /max_tokens|max_completion_tokens|maximum.*tokens/.test(m)) { sendMaxTokens = false; round--; continue; }
+                    if (includeUsage && m.includes("stream_options")) { includeUsage = false; continue; }
+                    if (sendMaxTokens && /max_tokens|max_completion_tokens|maximum.*tokens/.test(m)) { sendMaxTokens = false; continue; }
                     if (tools.length && /tool|function/.test(m)) {
                         tools = [];
-                        round--;
                         continue;
                     }
                 }
@@ -348,6 +360,7 @@ export class OpenAICompatibleProvider implements ILLM {
                     const output = await toolset.executeTool(call.function.name, args, { db, userId, sessionId });
                     result = typeof output === "string" ? output : JSON.stringify(output);
                     yield { type: "function_call_output", tool_call_id: call.id, output: result } as LLMMessage;
+                    guard.record(call.function.name, result);
                     if (call.function.name === this.RAG_TOOL_NAME) {
                         for (const s of extractSources(output)) sources.add(s);
                         if (sources.size) yield { type: "sources", tool_call_id: call.id, sources: [...sources] } as unknown as LLMMessage;
@@ -355,6 +368,7 @@ export class OpenAICompatibleProvider implements ILLM {
                 } catch (toolErr) {
                     result = JSON.stringify({ error: true, message: toolErr instanceof Error ? toolErr.message : String(toolErr), hint: "Tool execution failed. Do not retry with the same arguments." });
                     yield { type: "function_call_output", tool_call_id: call.id, error: result } as LLMMessage;
+                    guard.record(call.function.name, result, true);
                 }
                 calls.push({ role: "tool_call", type: "tool_call", tool_call_id: call.id, name: call.function.name, arguments: args });
                 outputs.push({ role: "tool_call_output", type: "tool_call_output", tool_call_id: call.id, output: result });
@@ -366,8 +380,8 @@ export class OpenAICompatibleProvider implements ILLM {
                 yield errorChunk("error", `Couldn't save the tool result: ${dbErr instanceof Error ? dbErr.message : dbErr}`);
                 return;
             }
+            guard.endRound();
         }
-        yield errorChunk("error", "Stopped after too many tool calls in one answer.");
     }
 
     // One-shot completion for the context engine's summaries. Uses the chat's

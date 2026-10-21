@@ -18,10 +18,7 @@ function sizeOf(m: LLMMessage): number {
  * assistant reply or a tool result whose tool call was cut off. System
  * messages are always kept.
  */
-export function windowHistory(
-    messages: LLMMessage[],
-    maxMessages: number = MAX_MESSAGES,
-    maxChars: number = MAX_CHARS,
+export function windowHistory(messages: LLMMessage[],maxMessages: number = MAX_MESSAGES,maxChars: number = MAX_CHARS,
 ): LLMMessage[] {
     const system = messages.filter((m) => m.role === "system");
     const convo = messages.filter((m) => m.role !== "system");
@@ -46,3 +43,4 @@ export function windowHistory(
 
     return [...system, ...convo.slice(start)];
 }
+ 

@@ -98,6 +98,8 @@ export type AgentScheduleRow = {
     weekday: number | null;
     timezone: string;
     deliver_whatsapp: boolean;
+    deliver_email: boolean;
+    email_to: string[];
     enabled: boolean;
     session_id: string | null;
     next_run_at: Date | null;
@@ -122,7 +124,7 @@ export type AgentInput = Pick<AgentRow, "name" | "icon" | "description" | "instr
     // Omitted (older clients) → unchanged on update, "all" on create.
     & { skill_mode?: AgentRow["skill_mode"]; skill_ids?: string[]; helper_agent_ids?: string[] };
 export type FunctionInput = Pick<AgentFunctionRow, "name" | "description" | "method" | "url" | "parameters" | "headers" | "enabled">;
-export type ScheduleInput = Pick<AgentScheduleRow, "name" | "prompt" | "frequency" | "interval_hours" | "time_of_day" | "weekday" | "timezone" | "deliver_whatsapp" | "enabled">;
+export type ScheduleInput = Pick<AgentScheduleRow, "name" | "prompt" | "frequency" | "interval_hours" | "time_of_day" | "weekday" | "timezone" | "deliver_whatsapp" | "deliver_email" | "email_to" | "enabled">;
 
 const json = (v: unknown) => JSON.stringify(v ?? []);
 
@@ -307,10 +309,10 @@ export class AgentRepository {
 
     async createSchedule(agentId: string, userId: string, s: ScheduleInput, nextRunAt: Date | null): Promise<AgentScheduleRow> {
         const { rows } = await this.db.query<AgentScheduleRow>(
-            `INSERT INTO agent_schedules (id, agent_id, user_id, name, prompt, frequency, interval_hours, time_of_day, weekday, timezone, deliver_whatsapp, enabled, next_run_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+            `INSERT INTO agent_schedules (id, agent_id, user_id, name, prompt, frequency, interval_hours, time_of_day, weekday, timezone, deliver_whatsapp, enabled, next_run_at, deliver_email, email_to)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
             [randomUUID(), agentId, userId, s.name, s.prompt, s.frequency, s.interval_hours, s.time_of_day, s.weekday, s.timezone,
-             s.deliver_whatsapp, s.enabled, nextRunAt]
+             s.deliver_whatsapp, s.enabled, nextRunAt, s.deliver_email, json(s.email_to)]
         );
         return rows[0];
     }
@@ -318,10 +320,10 @@ export class AgentRepository {
     async updateSchedule(agentId: string, id: string, s: ScheduleInput, nextRunAt: Date | null): Promise<AgentScheduleRow | null> {
         const { rows } = await this.db.query<AgentScheduleRow>(
             `UPDATE agent_schedules SET name=$3, prompt=$4, frequency=$5, interval_hours=$6, time_of_day=$7, weekday=$8,
-                    timezone=$9, deliver_whatsapp=$10, enabled=$11, next_run_at=$12
+                    timezone=$9, deliver_whatsapp=$10, enabled=$11, next_run_at=$12, deliver_email=$13, email_to=$14
              WHERE agent_id=$1 AND id=$2 RETURNING *`,
             [agentId, id, s.name, s.prompt, s.frequency, s.interval_hours, s.time_of_day, s.weekday, s.timezone,
-             s.deliver_whatsapp, s.enabled, nextRunAt]
+             s.deliver_whatsapp, s.enabled, nextRunAt, s.deliver_email, json(s.email_to)]
         );
         return rows[0] ?? null;
     }

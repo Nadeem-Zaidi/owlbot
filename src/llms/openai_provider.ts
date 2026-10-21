@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { ToolLoopGuard } from "./tool_loop_guard";
 import type { ResponseFunctionToolCall, ResponseInputFile, ResponseInputImage, ResponseInputItem, ResponseInputText, ResponseOutputText } from "openai/resources/responses/responses";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool, ToolCall } from "../types/llm_message";
@@ -316,9 +317,21 @@ export class OpenAIProvider implements ILLM {
         // Text streamed for the current output item — saved if the user presses Stop.
         let pendingText = "";
 
+        // Ends runaway tool use with one final, tool-less answer.
+        const guard = new ToolLoopGuard();
+        let wrapUpSent = false;
+
         let continueLoop = true;
         while (continueLoop) {
             if (signal.aborted) break;
+            if (guard.shouldWrapUp) {
+                if (wrapUpSent) {
+                    yield { content: "", isDone: true, sources: collectedSources.size ? Array.from(collectedSources) : undefined };
+                    break;
+                }
+                wrapUpSent = true;
+                inputMessages = [...inputMessages, { type: "message", role: "system", content: [{ type: "input_text", text: guard.wrapUpInstruction() }] } as ResponseInputItem];
+            }
             const functionCallTools = new Map<string, any>();
             const mcpCallTools = new Map<string, any>();
             const codeInterpreterCalls = new Map<string, { id: string; container_id?: string; code: string; status: string }>();
@@ -341,6 +354,7 @@ export class OpenAIProvider implements ILLM {
                         max_output_tokens: this.config.maxTokens,
                         temperature: this.config.temperature,
                         tools: wireTools.length ? wireTools : undefined,
+                        ...(wrapUpSent && wireTools.length ? { tool_choice: "none" } : {}),
                         stream: true,
                     }),
                     signal,
@@ -648,6 +662,7 @@ export class OpenAIProvider implements ILLM {
                                         tool_call_id: item.tool_call_id,
                                         output: result,
                                     } as LLMMessage;
+                                    guard.record(item.name, result);
 
                                     try {
                                         if (item.name === this.RAG_TOOL_NAME) {
@@ -681,6 +696,7 @@ export class OpenAIProvider implements ILLM {
                                         message: errMsg,
                                         hint: "Tool execution failed. Do not retry with the same arguments."
                                     });
+                                    guard.record(item.name, result, true);
                                     yield {
                                         type: "function_call_output",
                                         tool_call_id: item.tool_call_id,
@@ -744,6 +760,7 @@ export class OpenAIProvider implements ILLM {
                             if (event.response?.usage) { roundBilled = true; yield usageIncrement(openaiUsage(event.response.usage), event.response.model ?? activeModel); }
                             if (!functionCallTools.size && !mcpCallTools.size) {
                                 if (calledAnyToolThisTurn) {
+                                    guard.endRound();
                                     break readLoop;
                                 }
                                 yield {

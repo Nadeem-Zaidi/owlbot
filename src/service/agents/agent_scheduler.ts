@@ -2,6 +2,7 @@ import { AgentRepository, AgentScheduleRow } from "../../repository/agent_reposi
 import { AgentService } from "./agent_service";
 import { computeNextRun } from "./schedule_time";
 import { AgentRuntime } from "../../core/runtime";
+import { EmailService } from "../../infra/email";
 
 const TICK_MS = 30_000;
 const RUN_TIMEOUT_MS = 5 * 60_000;
@@ -13,7 +14,7 @@ type Notifier = (userId: string, text: string) => Promise<boolean>;
 // Runs agent schedules. Every 30s it picks due schedules, moves each one's
 // next_run_at forward (so a slot can't run twice), then runs it: the task is
 // sent to the agent in that schedule's own chat, the reply is saved there,
-// and optionally sent to the user's WhatsApp.
+// and optionally sent to the user's WhatsApp and/or by email.
 export class AgentScheduler {
     private timer: NodeJS.Timeout | null = null;
     private running = new Set<string>();
@@ -25,6 +26,7 @@ export class AgentScheduler {
         private repo: AgentRepository,
         private agents: AgentService,
         private notify?: Notifier,
+        private email?: EmailService,
     ) {}
 
     start(): void {
@@ -96,6 +98,16 @@ export class AgentScheduler {
                 const body = ok ? text : `⚠️ The run failed: ${error ?? "no reply"}`;
                 const sent = await this.notify(s.user_id, `⏰ *${agent.name}* — ${s.name}\n\n${body}`).catch(() => false);
                 if (!sent) console.warn(`[agents] couldn't deliver "${s.name}" to WhatsApp (number not linked or bot offline)`);
+            }
+
+            if (s.deliver_email && this.email && s.email_to?.length) {
+                const body = ok ? text : `⚠️ The run failed: ${error ?? "no reply"}`;
+                const result = await this.email.sendForUser(s.user_id, {
+                    to: s.email_to,
+                    subject: `${ok ? "" : "⚠️ "}${agent.name} — ${s.name}`,
+                    text: `${body}\n\n—\nSent by your Owl Bot schedule "${s.name}".`,
+                });
+                if (!result.ok) console.warn(`[agents] couldn't email "${s.name}": ${result.error}`);
             }
         } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);

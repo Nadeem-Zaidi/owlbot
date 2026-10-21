@@ -5,16 +5,7 @@ import { estimateTokens, sumTokens } from "./tokens";
 import { renderTranscript } from "./transcript";
 import { metrics } from "../../infra/observability";
 
-// The context engine decides what part of a chat's stored history goes into
-// each model request (OpenClaw's "assemble" and "compact" steps).
-//
-// The whole conversation always stays in the database; only the request is
-// shaped. Providers call assemble() with the stored history just before
-// building their request.
 
-// One-shot completion used to write summaries. Each provider supplies its
-// own, so the summary runs on the same account (platform or the user's own
-// key) as the chat, and its tokens are recorded like a title's.
 export type Summarize = (system: string, user: string) => Promise<{ text: string; usage?: TokenCounts; model?: string }>;
 
 export type AssembleOptions = {
@@ -164,7 +155,7 @@ export class SummaryContextEngine implements ContextEngine {
     // newest messages within keepRatio of the budget, always including the
     // current turn, starting at a user message (never in the middle of a
     // tool call and its result).
-    private cutPoint(msgs: LLMMessage[]): number {
+    private  cutPoint(msgs: LLMMessage[]): number {
         let lastUser = msgs.length - 1;
         while (lastUser > 0 && msgs[lastUser].role !== "user") lastUser--;
         const keep = this.historyTokens * this.keepRatio;

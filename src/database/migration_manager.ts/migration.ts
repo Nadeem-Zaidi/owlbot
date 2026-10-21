@@ -1152,6 +1152,27 @@ export const migration_20261021100000: Migration = {
   ]
 };
 
+export const migration_20261022100000: Migration = {
+  version: "20261022100000",
+  description: "Scheduled agent runs can email their result (plus a per-user email log for the daily limit)",
+  up: [
+    `ALTER TABLE agent_schedules ADD COLUMN IF NOT EXISTS deliver_email BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE agent_schedules ADD COLUMN IF NOT EXISTS email_to JSONB NOT NULL DEFAULT '[]'`,
+    `CREATE TABLE IF NOT EXISTS email_log (
+      id         BIGSERIAL PRIMARY KEY,
+      user_id    TEXT NOT NULL,
+      recipients INTEGER NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_email_log_user ON email_log(user_id, created_at)`,
+  ],
+  down: [
+    `DROP TABLE IF EXISTS email_log`,
+    `ALTER TABLE agent_schedules DROP COLUMN IF EXISTS email_to`,
+    `ALTER TABLE agent_schedules DROP COLUMN IF EXISTS deliver_email`,
+  ]
+};
+
 
 export const migrations: Migration[] = [
 
@@ -1183,5 +1204,6 @@ export const migrations: Migration[] = [
   migration_20261018100000,
   migration_20261019100000,
   migration_20261020100000,
-  migration_20261021100000
+  migration_20261021100000,
+  migration_20261022100000
 ];

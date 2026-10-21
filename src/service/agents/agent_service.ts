@@ -1,4 +1,5 @@
 import { ModelRegistry } from "../model_registry";
+import { EmailService, MAX_RECIPIENTS, normalizeRecipients } from "../../infra/email";
 import { ToolDefinition } from "../../types/type";
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
@@ -53,6 +54,8 @@ type Deps = {
     registry?: ModelRegistry;
     // Tools every agent gets (documents in the side panel).
     alwaysTools?: ToolDefinition[];
+    // Outgoing email (schedules can email their result). Optional: off when SMTP isn't set up.
+    email?: EmailService;
 };
 
 const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
@@ -95,6 +98,7 @@ export class AgentService {
         return {
             builtinTools: BUILTIN_TOOLS,
             codeFunctions: { enabled: codeFunctionsEnabled(), canWrite: isOwner(email), email: email ?? null },
+            email: { enabled: !!this.deps.email?.enabled, maxRecipients: MAX_RECIPIENTS, accountEmail: email ?? null },
             providers,
             defaultProvider: this.deps.defaultProvider,
         };
@@ -563,7 +567,9 @@ export class AgentService {
         await this.requireAgent(userId, agentId);
         const existing = await this.deps.repo.getSchedule(agentId, scheduleId);
         if (!existing) throw new AgentError("Schedule not found", 404);
-        const input = this.validateSchedule({ ...existing, ...body });
+        // Only check the server's email setup when email is being turned on now
+        // (pausing an old email schedule must still work).
+        const input = this.validateSchedule({ ...existing, ...body }, body?.deliver_email === true);
         const next = input.enabled ? computeNextRun(input) : null;
         return scheduleDto((await this.deps.repo.updateSchedule(agentId, scheduleId, input, next))!);
     }
@@ -585,7 +591,7 @@ export class AgentService {
         return this.deps.repo.listRuns(agentId, 30);
     }
 
-    private validateSchedule(b: any): ScheduleInput {
+    private validateSchedule(b: any, checkEmailSetup = true): ScheduleInput {
         const input: ScheduleInput = {
             name: str(b?.name, 80, "Schedule name", true),
             prompt: str(b?.prompt, 4000, "Task", true),
@@ -595,8 +601,19 @@ export class AgentService {
             weekday: b?.frequency === "weekly" ? Number(b?.weekday) : null,
             timezone: typeof b?.timezone === "string" && b.timezone ? b.timezone : "UTC",
             deliver_whatsapp: !!b?.deliver_whatsapp,
+            deliver_email: !!b?.deliver_email,
+            email_to: [],
             enabled: b?.enabled !== false,
         };
+        try {
+            input.email_to = normalizeRecipients(b?.email_to);
+        } catch (err) {
+            throw new AgentError(err instanceof Error ? err.message : "Invalid email addresses");
+        }
+        if (input.deliver_email) {
+            if (checkEmailSetup && !this.deps.email?.enabled) throw new AgentError("Email isn't set up on this server yet");
+            if (!input.email_to.length) throw new AgentError("Add at least one email address to send the result to");
+        }
         try {
             validateTiming(input);
         } catch (err) {

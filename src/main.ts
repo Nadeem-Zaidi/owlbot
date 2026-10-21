@@ -1,4 +1,5 @@
 import "dotenv/config";   // ← add this at the very top
+import { EmailService } from "./infra/email";
 import { installConsoleBridge, registerGauge } from "./infra/observability";
 import { EventBus } from "./infra/events/event_bus";
 import { LiveSocketServer } from "./gateway/live_socket";
@@ -213,7 +214,11 @@ async function wa() {
     setContextEngine(new SkillIndexEngine(contextEngine(), skillService));
     if (memoryEnabled) setContextEngine(new MemoryRecallEngine(contextEngine(), memoryService));
     const agentRepo = new AgentRepository(db);
+    // Outgoing email over SMTP (off unless SMTP_HOST is set).
+    const emailService = new EmailService(db);
+    if (emailService.enabled) console.log("[email] SMTP configured");
     const agentService = new AgentService({
+        email: emailService,
         repo: agentRepo,
         messageService: chatMessageService,
         providers,
@@ -355,6 +360,7 @@ async function wa() {
         agentRepo,
         agentService,
         (userId, text) => whatsappManager.bridge ? whatsappManager.bridge.notifyUser(userId, text) : Promise.resolve(false),
+        emailService,
     );
     // Safe on several servers (each slot is claimed atomically); turn off with
     // SCHEDULER_ENABLED=false to run it only on chosen instances.

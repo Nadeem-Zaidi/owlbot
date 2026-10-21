@@ -1,4 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { ToolLoopGuard } from "./tool_loop_guard";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
@@ -292,6 +293,9 @@ export class AnthropicProvider implements ILLM {
         let titleGenerated = false;
         const collectedSources = new Set<string>();
         let jsonRetries = 0;
+        // Ends runaway tool use with one final, tool-less answer.
+        const guard = new ToolLoopGuard();
+        let wrapUpSent = false;
 
         while (true) {
             if (signal.aborted) {
@@ -309,6 +313,7 @@ export class AnthropicProvider implements ILLM {
                     ...(system ? { system } : {}),
                     messages: history,
                     ...(tools.length ? { tools } : {}),
+                    ...(wrapUpSent && tools.length ? { tool_choice: { type: "none" as const } } : {}),
                     ...this.requestOptions(activeModel),
                 }, { signal });
 
@@ -440,6 +445,7 @@ export class AnthropicProvider implements ILLM {
                     const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId, sessionId });
                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                     yield { type: "function_call_output", tool_call_id: toolUse.id, output: result } as LLMMessage;
+                    guard.record(toolUse.name, result);
 
                     if (toolUse.name === this.RAG_TOOL_NAME) {
                         const sources = this.extractSources(toolOutput);
@@ -457,6 +463,7 @@ export class AnthropicProvider implements ILLM {
                         hint: "Tool execution failed. Do not retry with the same arguments.",
                     });
                     yield { type: "function_call_output", tool_call_id: toolUse.id, error: result } as LLMMessage;
+                    guard.record(toolUse.name, result, true);
                 }
 
                 toolCalls.push({ role: "tool_call", type: "tool_call", tool_call_id: toolUse.id, name: toolUse.name, arguments: args });
@@ -475,7 +482,18 @@ export class AnthropicProvider implements ILLM {
             }
 
             // All results go back in a single user message.
-            history.push({ role: "user", content: toolResults });
+            guard.endRound();
+            if (guard.shouldWrapUp && wrapUpSent) {
+                // Tools were switched off and the model still asked for one.
+                yield { content: "", isDone: true, sources: collectedSources.size ? Array.from(collectedSources) : undefined };
+                return;
+            }
+            if (guard.shouldWrapUp) {
+                wrapUpSent = true;
+                history.push({ role: "user", content: [...toolResults, { type: "text", text: guard.wrapUpInstruction() }] });
+            } else {
+                history.push({ role: "user", content: toolResults });
+            }
         }
     }
 
