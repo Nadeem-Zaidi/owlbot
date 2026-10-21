@@ -43,8 +43,9 @@ export class AgentRoutes extends BaseRouter<AgentService> {
         r.post("/mcp/discover", this.h(async (req, res) => res.json({ tools: await this.service.discoverMcp(req.body) })));
 
         // ── agents ──
-        r.get("/", this.h(async (req, res) => res.json({ agents: await this.service.list(uid(req)) })));
-        r.post("/", this.h(async (req, res) => res.status(201).json(await this.service.create(uid(req), req.body))));
+        // In the active space: the team workspace from X-Workspace-Id, or personal.
+        r.get("/", this.h(async (req, res) => res.json({ agents: await this.service.list(uid(req), req.workspace ?? null) })));
+        r.post("/", this.h(async (req, res) => res.status(201).json(await this.service.create(uid(req), req.body, req.workspace ?? null))));
         r.get("/:id", this.h(async (req, res) => res.json(await this.service.get(uid(req), p(req, "id")))));
         r.put("/:id", this.h(async (req, res) => res.json(await this.service.update(uid(req), p(req, "id"), req.body))));
         r.delete("/:id", this.h(async (req, res) => {

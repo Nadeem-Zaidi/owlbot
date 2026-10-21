@@ -82,7 +82,7 @@ export function createVectorSearchTool(vectorDb: IVectorDb, embed: EmbeddingProv
       const vector = await embed.embed(query);
       if (!ctx.userId) throw new Error("Knowledge base search needs a signed-in user.");
       const results = await vectorDb.search(vector, limit, true, {
-        prefix: `${ctx.userId}/`,
+        prefix: `${ctx.kbScope ?? ctx.userId}/`,
         sourceFiles: documentKeys.length ? documentKeys : undefined,
         text: query,
         minScore: MIN_SCORE,

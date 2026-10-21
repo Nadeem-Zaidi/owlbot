@@ -272,7 +272,7 @@ export class OpenAIProvider implements ILLM {
         }
         // Agents bring their own MCP servers (as function tools), so the
         // env-configured hosted ones are only used for plain chats.
-        const mcpTools = (run ? [] : this.getMcpServerConfigs()).map((server) => ({
+        const mcpTools = (run?.tools ? [] : this.getMcpServerConfigs()).map((server) => ({
             type: "mcp",
             server_label: server.label,
             server_url: server.url,
@@ -655,7 +655,7 @@ export class OpenAIProvider implements ILLM {
                                         throw new Error(`Model produced invalid JSON arguments for "${item.name}": ${item.arguments}`);
                                     }
 
-                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId, sessionId });
+                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId, sessionId, kbScope: run?.kbScope });
                                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                                     yield {
                                         type: "function_call_output",

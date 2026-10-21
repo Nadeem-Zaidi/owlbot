@@ -1,11 +1,13 @@
 import "dotenv/config";  
+import { kbScope } from "../core/workspaces/workspace_context";
 import dotenv from "dotenv";
 import { InvalidSession, SessionValidationError, ValidationError } from "../error_handling/app_error";
 import { BaseRouter } from "./base_router";
 import { MessageService } from "../service/message_service";
 import { ILLM } from "../interfaces/illm";
 import { LLMMessage } from "../types/llm_message";
-import { LLMProvider } from "../llms/llm_factory";
+import { LLMProvider, PROVIDER_LABELS } from "../llms/llm_factory";
+import { modelLabel } from "../service/model_registry";
 import { AgentService } from "../service/agents/agent_service";
 import { NativeAgentService } from "../service/native_agents/native_agent_service";
 import { KnowledgeBase } from "../service/knowledge_base";
@@ -31,22 +33,6 @@ function decodeCursor(raw: string): { ts: string; id: string } | null {
     return null;
 }
 
-const PROVIDER_LABELS: Partial<Record<LLMProvider, string>> = {
-    openai: "ChatGPT",
-    anthropic: "Claude",
-};
-
-// "claude-sonnet-5-5" → "Claude Sonnet 5.5", "gpt-4o-mini" → "GPT-4o mini".
-// Anything unrecognised is shown as its raw id.
-function modelLabel(id: string): string {
-    const claude = id.match(/^claude-([a-z]+)-(\d+)(?:-(\d+))?$/);
-    if (claude) {
-        const [, family, major, minor] = claude;
-        return `Claude ${family[0].toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ""}`;
-    }
-    if (id.startsWith("gpt-")) return `GPT-${id.slice(4).replace(/-/g, " ")}`;
-    return id;
-}
 
 export class ChatMessages extends BaseRouter<MessageService> {
     providers: Map<LLMProvider, ILLM>;
@@ -207,6 +193,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 strictModel: true,
                 agentId: typeof agentId === "string" ? agentId : undefined,
                 nativeAgentId: typeof nativeAgentId === "string" ? nativeAgentId : undefined,
+                ...(req.workspace ? { kbScope: kbScope(req) } : {}),
             });
             void this.billing?.rememberUser(req.user!.sub, req.user!.email);
 

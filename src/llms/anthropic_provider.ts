@@ -274,10 +274,20 @@ export class AnthropicProvider implements ILLM {
     // `_apiKey` is accepted to satisfy ILLM (the OpenAI provider uses it for
     // raw fetch calls); this provider authenticates with the key it was
     // constructed with.
-    async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, _apiKey: string, signal: AbortSignal, model?: string, run?: ChatRunOptions): AsyncGenerator<LLMMessage, void, unknown> {
+    async *chatStream(
+        messages: LLMMessage[], 
+        userId: string, 
+        sessionId: string, 
+        _apiKey: string, 
+        signal: AbortSignal, 
+        model?: string, 
+        run?: ChatRunOptions
+    ): AsyncGenerator<LLMMessage, void, unknown> {
         const activeModel = model ?? this.config.model;
         const toolset: ToolSource = run?.tools ?? this.tools;
+        // save the incoming message
         await this.messageService.runTransaction(sessionId, messages);
+        //load the user message for the current session Id
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
         // The context engine picks what part of the stored history is sent
         // (recent messages + a summary of older ones); everything stays stored.
@@ -442,7 +452,7 @@ export class AnthropicProvider implements ILLM {
                     const invalid = this.validateToolInput(toolset, toolUse.name, args);
                     if (invalid) throw new Error(`Invalid arguments for "${toolUse.name}": ${invalid}`);
 
-                    const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId, sessionId });
+                    const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId, sessionId, kbScope: run?.kbScope });
                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                     yield { type: "function_call_output", tool_call_id: toolUse.id, output: result } as LLMMessage;
                     guard.record(toolUse.name, result);

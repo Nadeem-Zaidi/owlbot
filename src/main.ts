@@ -1,4 +1,8 @@
 import "dotenv/config";   // ← add this at the very top
+import { createWorkspaceRouter } from "./routes/workspace_routes";
+import { setWorkspaceService } from "./core/workspaces/workspace_context";
+import { WorkspaceService, kbScopeFor } from "./core/workspaces/workspace_service";
+import { WorkspaceRepository } from "./repository/workspace_repository";
 import { EmailService } from "./infra/email";
 import { installConsoleBridge, registerGauge } from "./infra/observability";
 import { EventBus } from "./infra/events/event_bus";
@@ -217,7 +221,18 @@ async function wa() {
     // Outgoing email over SMTP (off unless SMTP_HOST is set).
     const emailService = new EmailService(db);
     if (emailService.enabled) console.log("[email] SMTP configured");
+    // Team workspaces: shared agents and knowledge base, members with roles.
+    const workspaceService = new WorkspaceService(new WorkspaceRepository(db));
+    setWorkspaceService(workspaceService);
+    // A deleted workspace's agents go with it (database cascade); its shared
+    // files and their search index are removed here.
+    const deleteWorkspaceFiles = async (workspaceId: string) => {
+        const prefix = `${kbScopeFor(workspaceId, "")}/`;
+        await s3Client.deleteFolder(prefix);
+        for (const f of (await vectorDb.listSourceFiles?.(prefix)) ?? []) await vectorDb.deleteBySourceFile(f.source_file);
+    };
     const agentService = new AgentService({
+        workspaces: workspaceService,
         email: emailService,
         repo: agentRepo,
         messageService: chatMessageService,
@@ -409,6 +424,7 @@ async function wa() {
     const { searchRouter, usageRouter } = createInsightsRouters(new SearchRepository(db), usageRepo);
 
     const gateway = new VGateway(Number(process.env.PORT ?? 3000), db, chatRoutes, storageRoutes, whatsappRoutes, agentRoutes, pipelineRoutes, [
+        { path: "/api/workspaces", router: createWorkspaceRouter(workspaceService, deleteWorkspaceFiles) },
         { path: "/api/search", router: searchRouter },
         { path: "/api/usage", router: usageRouter },
         { path: "/api/native-agents", router: createNativeAgentRouter(nativeAgentService) },

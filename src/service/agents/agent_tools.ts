@@ -41,7 +41,7 @@ function builtinTool(id: string, deps: BuiltinDeps, documentKeys: string[]): Too
                 description: "Lists the documents available to you in the knowledge base.",
                 parameters: { type: "object", properties: {}, required: [] },
                 execute: async (_args, ctx) => {
-                    const docs = (await deps.kb.listDocuments(requireUser(ctx))).filter((d) => inScope(d.key));
+                    const docs = (await deps.kb.listDocuments(kbOf(ctx))).filter((d) => inScope(d.key));
                     return { documents: docs.map((d) => d.name), count: docs.length };
                 },
             };
@@ -55,7 +55,7 @@ function builtinTool(id: string, deps: BuiltinDeps, documentKeys: string[]): Too
                     required: ["name"],
                 },
                 execute: async (args, ctx) => {
-                    const userId = requireUser(ctx);
+                    const userId = kbOf(ctx);
                     const wanted = String(args.name ?? "").trim().toLowerCase();
                     const doc = (await deps.kb.listDocuments(userId))
                         .filter((d) => inScope(d.key))
@@ -96,6 +96,11 @@ function builtinTool(id: string, deps: BuiltinDeps, documentKeys: string[]): Too
 function requireUser(ctx: ToolContext): string {
     if (!ctx.userId) throw new Error("This tool needs a signed-in user.");
     return ctx.userId;
+}
+
+// The knowledge-base folder: the team's (workspace agent) or the user's own.
+function kbOf(ctx: ToolContext): string {
+    return ctx.kbScope ?? requireUser(ctx);
 }
 
 // ── HTTP functions ───────────────────────────────────────────────────────

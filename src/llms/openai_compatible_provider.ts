@@ -24,7 +24,9 @@ type ChatMessage =
     | { role: "assistant"; content: string | null; tool_calls?: WireToolCall[] }
     | { role: "tool"; tool_call_id: string; content: string };
 
-type WireToolCall = { id: string; type: "function"; function: { name: string; arguments: string } };
+// extra_content: provider data that must go back with the call unchanged
+// (Gemini 3 puts its "thought signature" there; the next request fails without it).
+type WireToolCall = { id: string; type: "function"; function: { name: string; arguments: string }; extra_content?: unknown };
 
 const TITLE_PROMPT = "Write a short, specific title (4–8 words, Title Case, max 60 characters) for this conversation. Return only the title, no quotes.";
 const REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
@@ -141,9 +143,12 @@ export class OpenAICompatibleProvider implements ILLM {
     }
 
     private toolDefinitions(toolset: ToolSource) {
+        // Gemini's OpenAI layer rejects some JSON-schema keywords (MCP tools
+        // often include them), which would fail the whole request.
+        const clean = this.providerName === "gemini" ? stripSchemaKeywords : (p: unknown) => p;
         return toolset.getAll().map((def) => ({
             type: "function" as const,
-            function: { name: def.name, description: def.description, parameters: def.parameters },
+            function: { name: def.name, description: def.description, parameters: clean(def.parameters) },
         }));
     }
 
@@ -209,6 +214,7 @@ export class OpenAICompatibleProvider implements ILLM {
                         if (tc.id) cur.id = tc.id;
                         if (tc.function?.name) cur.function.name += tc.function.name;
                         if (tc.function?.arguments) cur.function.arguments += tc.function.arguments;
+                        if (tc.extra_content) cur.extra_content = tc.extra_content;
                         calls.set(idx, cur);
                     }
                     if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -357,7 +363,7 @@ export class OpenAICompatibleProvider implements ILLM {
 
                 let result: string;
                 try {
-                    const output = await toolset.executeTool(call.function.name, args, { db, userId, sessionId });
+                    const output = await toolset.executeTool(call.function.name, args, { db, userId, sessionId, kbScope: run?.kbScope });
                     result = typeof output === "string" ? output : JSON.stringify(output);
                     yield { type: "function_call_output", tool_call_id: call.id, output: result } as LLMMessage;
                     guard.record(call.function.name, result);
@@ -482,4 +488,21 @@ function toErrorChunk(err: unknown): LLMMessage {
     if (err instanceof Error && (err.name === "TimeoutError")) return errorChunk("timeout", "The provider took too long to answer.");
     console.error("[OpenAICompatibleProvider] request failed:", err);
     return errorChunk("network", "Couldn't reach the provider. Check the base URL.");
+}
+
+// Removes JSON-schema keywords Gemini's OpenAI-compatible API refuses, at
+// any depth, keeping the rest of the schema as is.
+const GEMINI_UNSUPPORTED = new Set(["$schema", "$id", "$ref", "$defs", "definitions", "additionalProperties", "patternProperties", "unevaluatedProperties", "const", "examples", "default"]);
+export function stripSchemaKeywords(schema: unknown): unknown {
+    if (Array.isArray(schema)) return schema.map(stripSchemaKeywords);
+    if (!schema || typeof schema !== "object") return schema;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+        if (GEMINI_UNSUPPORTED.has(k)) continue;
+        // "properties" maps names → schemas: keep every name, clean each schema.
+        out[k] = k === "properties" && v && typeof v === "object" && !Array.isArray(v)
+            ? Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([name, sub]) => [name, stripSchemaKeywords(sub)]))
+            : stripSchemaKeywords(v);
+    }
+    return out;
 }

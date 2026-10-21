@@ -7,11 +7,38 @@ import { ILLM } from "../interfaces/illm";
 import { LLMConfig } from "../types/lmconfig";
 import { OpenAIProvider } from "./openai_provider";
 import { AnthropicProvider } from "./anthropic_provider";
+import { OpenAICompatibleProvider } from "./openai_compatible_provider";
 import { MessageService } from "../service/message_service";
 import { LLMTool } from "../tools/tool_registry";
 import { IFileStore } from "../interfaces/ifilestore";
 
-export type LLMProvider = "openai" | "anthropic" | "ollama" | "gemma";
+export type LLMProvider = "openai" | "anthropic" | "deepseek" | "gemini" | "ollama" | "gemma";
+
+// Names shown in the model picker, agent editor and usage reports.
+export const PROVIDER_LABELS: Record<string, string> = {
+    openai: "ChatGPT",
+    anthropic: "Claude",
+    deepseek: "DeepSeek",
+    gemini: "Gemini",
+};
+
+// Providers reached through their OpenAI-compatible endpoints (one adapter,
+// OpenAICompatibleProvider). Model lists are defaults; override with
+// <NAME>_MODEL / <NAME>_MODELS in .env as providers release new models.
+const COMPATIBLE: Partial<Record<LLMProvider, { keyEnv: string; baseUrl: string; model: string; models: string }>> = {
+    deepseek: {
+        keyEnv: "DEEPSEEK_API_KEY",
+        baseUrl: "https://api.deepseek.com/v1",
+        model: "deepseek-flash",
+        models: "deepseek-flash,deepseek-v4-pro",
+    },
+    gemini: {
+        keyEnv: "GEMINI_API_KEY",
+        baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
+        model: "gemini-3.8-flash",
+        models: "gemini-3.8-flash,gemini-4-argon,gemini-3.5-flash-lite",
+    },
+};
 
 interface LLMContext {
     userId: string;   // NEW — was userid/sessionid, now matches chatStream's casing elsewhere
@@ -60,6 +87,14 @@ export class LLMFactory {
                     throw new Error("ANTHROPIC_API_KEY is not set");
                 }
                 return new AnthropicProvider(apiKey, config, messageService, toolRegistry);
+            }
+            case "deepseek":
+            case "gemini": {
+                const spec = COMPATIBLE[provider]!;
+                const apiKey = process.env[spec.keyEnv];
+                if (!apiKey) throw new Error(`${spec.keyEnv} is not set`);
+                const baseUrl = process.env[`${provider.toUpperCase()}_BASE_URL`] || spec.baseUrl;
+                return new OpenAICompatibleProvider(apiKey, baseUrl, config, messageService, toolRegistry, provider);
             }
             case "gemma":
             case "ollama":
@@ -110,6 +145,8 @@ export class LLMFactory {
         const keys: Partial<Record<LLMProvider, string | undefined>> = {
             openai: process.env.OPENAI_API_KEY,
             anthropic: process.env.ANTHROPIC_API_KEY,
+            deepseek: process.env.DEEPSEEK_API_KEY,
+            gemini: process.env.GEMINI_API_KEY,
         };
 
         for (const [provider, key] of Object.entries(keys) as [LLMProvider, string | undefined][]) {
@@ -124,7 +161,7 @@ export class LLMFactory {
         }
 
         if (!providers.size) {
-            throw new Error("No LLM provider configured — set OPENAI_API_KEY and/or ANTHROPIC_API_KEY");
+            throw new Error("No LLM provider configured — set at least one of OPENAI_API_KEY, ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY");
         }
 
         const preferred = process.env.LLM_PROVIDER as LLMProvider | undefined;
@@ -148,6 +185,20 @@ export class LLMFactory {
                 maxTokens: process.env.ANTHROPIC_MAX_TOKENS
                     ? parseInt(process.env.ANTHROPIC_MAX_TOKENS, 10)
                     : 64000,
+            };
+        }
+
+        const compatible = COMPATIBLE[provider];
+        if (compatible) {
+            const prefix = provider.toUpperCase();
+            const model = process.env[`${prefix}_MODEL`] || compatible.model;
+            return {
+                model,
+                models: LLMFactory.modelList(model, process.env[`${prefix}_MODELS`] ?? compatible.models),
+                temperature,
+                maxTokens: process.env[`${prefix}_MAX_TOKENS`]
+                    ? parseInt(process.env[`${prefix}_MAX_TOKENS`]!, 10)
+                    : 8192,
             };
         }
 

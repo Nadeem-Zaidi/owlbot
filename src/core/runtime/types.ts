@@ -21,11 +21,13 @@ export type RunRequest = {
     // to that agent. Later turns use whatever the session is attached to.
     agentId?: string;
     nativeAgentId?: string;
+    // Knowledge-base folder for plain chats (the active team workspace's).
+    kbScope?: string;
 };
 
 // What a session's turn runs on, after resolving its agent and model.
 export type RunTarget =
-    | { kind: "chat"; llm: ILLM; model: string; run?: undefined }
+    | { kind: "chat"; llm: ILLM; model: string; run?: { kbScope: string } }
     | { kind: "agent"; llm: ILLM; model: string; run: ChatRunOptions; agentId: string }
     | { kind: "native"; llm: ILLM; model: string; run?: undefined; agentId: string };
 

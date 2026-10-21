@@ -11,7 +11,8 @@ const extensionOf = (part: any): string =>
 // upload (stored next to the file as Markdown) as a document part, so the
 // model can actually read them. Same shape as "Explain this document", so
 // the web app shows it as a document card and search skips it.
-export async function withAttachmentText(message: LLMMessage, userId: string, kb: KnowledgeBase): Promise<LLMMessage> {
+// `scope`: the knowledge-base folder the file was uploaded to (user id, or "ws_<id>" in a team).
+export async function withAttachmentText(message: LLMMessage, scope: string, kb: KnowledgeBase): Promise<LLMMessage> {
     if (!Array.isArray(message.content)) return message;
     const parts = message.content as any[];
     const extra: any[] = [];
@@ -22,7 +23,7 @@ export async function withAttachmentText(message: LLMMessage, userId: string, kb
         if (!name || NATIVE_EXTENSIONS.has(extensionOf(part))) continue;
         if (parts.some((p) => p?.documentName === name)) continue; // already attached
 
-        const doc = await kb.readDocument(userId, name).catch(() => null);
+        const doc = await kb.readDocument(scope, name).catch(() => null);
         if (doc) {
             extra.push({
                 type: "text",

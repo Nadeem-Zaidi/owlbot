@@ -1,5 +1,5 @@
 import { ChatRunOptions, ILLM } from "../interfaces/illm";
-import { LLMProvider } from "../llms/llm_factory";
+import { LLMProvider, PROVIDER_LABELS } from "../llms/llm_factory";
 import { OpenAIProvider } from "../llms/openai_provider";
 import { AnthropicProvider } from "../llms/anthropic_provider";
 import { OpenAICompatibleProvider, errorMessage } from "../llms/openai_compatible_provider";
@@ -32,7 +32,7 @@ const LABEL_MAX = 60;
 const LLM_CACHE_MAX = 500;
 const TEST_TIMEOUT_MS = 15_000;
 
-const PLATFORM_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
+const PLATFORM_LABELS = PROVIDER_LABELS;
 const KIND_LABELS: Record<LLMKeyKind, string> = { openai: "OpenAI", anthropic: "Anthropic", openai_compatible: "OpenAI-compatible" };
 const DEFAULT_BASE: Partial<Record<LLMKeyKind, string>> = {
     openai: "https://api.openai.com/v1",
@@ -65,6 +65,12 @@ export function modelLabel(id: string): string {
         return `Claude ${family[0].toUpperCase()}${family.slice(1)} ${major}${minor ? `.${minor}` : ""}`;
     }
     if (id.startsWith("gpt-")) return `GPT-${id.slice(4).replace(/-/g, " ")}`;
+    // "gemini-3.8-flash" → "Gemini 3.8 Flash", "deepseek-v4-pro" → "DeepSeek V4 Pro"
+    const named = id.match(/^(gemini|deepseek)-(.+)$/);
+    if (named) {
+        const words = named[2].split("-").map((w) => (/^v?\d/.test(w) ? w.toUpperCase().replace(/^(\d)/, "$1") : w[0].toUpperCase() + w.slice(1)));
+        return `${named[1] === "gemini" ? "Gemini" : "DeepSeek"} ${words.join(" ")}`;
+    }
     return id.includes("/") ? id.split("/").pop()! : id;
 }
 

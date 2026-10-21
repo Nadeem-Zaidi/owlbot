@@ -1174,6 +1174,71 @@ export const migration_20261022100000: Migration = {
 };
 
 
+export const migration_20261023100000: Migration = {
+  version: "20261023100000",
+  description: "Team workspaces: members with roles, invite links, audit log; agents can belong to a workspace",
+  up: [
+    `CREATE TABLE IF NOT EXISTS workspaces (
+      id          TEXT PRIMARY KEY,
+      name        TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 60),
+      created_by  TEXT NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE TABLE IF NOT EXISTS workspace_members (
+      workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      user_id       TEXT NOT NULL,
+      role          TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
+      display_name  TEXT NOT NULL DEFAULT '',
+      email         TEXT,
+      phone_hint    TEXT,
+      invited_by    TEXT,
+      joined_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+      PRIMARY KEY (workspace_id, user_id)
+    )`,
+    // "Which workspaces am I in?" runs on every team request.
+    `CREATE INDEX IF NOT EXISTS idx_workspace_members_user ON workspace_members(user_id)`,
+    // Exactly one owner per workspace.
+    `CREATE UNIQUE INDEX IF NOT EXISTS uq_workspace_one_owner ON workspace_members(workspace_id) WHERE role = 'owner'`,
+    `CREATE TABLE IF NOT EXISTS workspace_invites (
+      id            TEXT PRIMARY KEY,
+      workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      token_hash    TEXT NOT NULL UNIQUE,
+      role          TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+      created_by    TEXT NOT NULL,
+      max_uses      INTEGER NOT NULL DEFAULT 1 CHECK (max_uses BETWEEN 1 AND 500),
+      uses          INTEGER NOT NULL DEFAULT 0 CHECK (uses >= 0),
+      expires_at    TIMESTAMPTZ NOT NULL,
+      revoked_at    TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_workspace_invites_ws ON workspace_invites(workspace_id, created_at DESC)`,
+    `CREATE TABLE IF NOT EXISTS workspace_audit (
+      id            BIGSERIAL PRIMARY KEY,
+      workspace_id  TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+      actor_id      TEXT NOT NULL,
+      action        TEXT NOT NULL,
+      target        TEXT,
+      details       JSONB NOT NULL DEFAULT '{}',
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_workspace_audit_ws ON workspace_audit(workspace_id, id DESC)`,
+    // NULL = the creator's personal agent (every existing agent stays as it is).
+    `ALTER TABLE agents ADD COLUMN IF NOT EXISTS workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE`,
+    `CREATE INDEX IF NOT EXISTS idx_agents_workspace ON agents(workspace_id, updated_at DESC) WHERE workspace_id IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_agents_personal ON agents(user_id, updated_at DESC) WHERE workspace_id IS NULL`,
+  ],
+  down: [
+    `DROP INDEX IF EXISTS idx_agents_personal`,
+    `DROP INDEX IF EXISTS idx_agents_workspace`,
+    `ALTER TABLE agents DROP COLUMN IF EXISTS workspace_id`,
+    `DROP TABLE IF EXISTS workspace_audit`,
+    `DROP TABLE IF EXISTS workspace_invites`,
+    `DROP TABLE IF EXISTS workspace_members`,
+    `DROP TABLE IF EXISTS workspaces`,
+  ]
+};
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -1205,5 +1270,6 @@ export const migrations: Migration[] = [
   migration_20261019100000,
   migration_20261020100000,
   migration_20261021100000,
-  migration_20261022100000
+  migration_20261022100000,
+  migration_20261023100000
 ];

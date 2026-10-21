@@ -1,4 +1,5 @@
 import multer from "multer";
+import { kbScope } from "../core/workspaces/workspace_context";
 import { IFileStore, ListResult } from "../interfaces/ifilestore";
 import { BaseRouter } from "./base_router";
 import { Embedder } from "../database/vector_db/embedding";
@@ -23,9 +24,12 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
     }
 
     registerRouter(): void {
-        // Documents indexed in the user's knowledge base (one row per file).
+        // Every route works on the active space's knowledge base: the team's
+        // shared folder in a workspace (X-Workspace-Id), the user's own otherwise.
+
+        // Documents indexed in the knowledge base (one row per file).
         this.router.get("/documents", this.asyncHandler(async (req, res) => {
-            const documents = await this.kb.listDocuments(req.user!.sub);
+            const documents = await this.kb.listDocuments(kbScope(req));
             return res.status(200).json({ documents });
         }));
 
@@ -34,7 +38,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
             const raw = typeof req.query.key === "string" ? req.query.key : "";
             let doc;
             try {
-                doc = await this.kb.readDocument(req.user!.sub, raw);
+                doc = await this.kb.readDocument(kbScope(req), raw);
             } catch (err) {
                 return res.status(400).json({ message: err instanceof Error ? err.message : "Invalid document key" });
             }
@@ -49,7 +53,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
             try {
                 const continuationToken = req.query.continuationToken as string | undefined;
                 const search = (req.query.search as string | undefined)?.trim();
-                const prefix = `${req.user?.sub}/`;
+                const prefix = `${kbScope(req)}/`;
 
                 // S3's ListObjectsV2 only supports a `Prefix` match (from the
                 // start of the key), not an arbitrary substring search, so a
@@ -60,7 +64,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                 // listing is paginated.
                 if (search) {
                     const matches = await this.searchFiles(prefix, search);
-                    return res.status(200).json({ files: await this.withRag(req.user!.sub, matches), continuationToken: undefined });
+                    return res.status(200).json({ files: await this.withRag(kbScope(req), matches), continuationToken: undefined });
                 }
 
                 const result = await this.service.list(prefix, continuationToken, { includeUrls: true });
@@ -71,7 +75,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                 // meant `hasNextPage` was always false after page 1, so "Next"
                 // stayed disabled forever regardless of how many files existed.
                 return res.status(200).json({
-                    files: await this.withRag(req.user!.sub, result.files),
+                    files: await this.withRag(kbScope(req), result.files),
                     continuationToken: result.nextToken,
                 });
             } catch (error) {
@@ -84,7 +88,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
         // Body: { keys: string[] } for specific files, or { all: true } for
         // every file of the user that isn't indexed yet.
         this.router.post("/index_files", this.asyncHandler(async (req, res) => {
-            const userId = req.user!.sub;
+            const userId = kbScope(req);
             const { keys, all } = req.body ?? {};
             let targets: string[];
             if (all === true) {
@@ -95,7 +99,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
                 return res.status(400).json({ message: "Send { keys: [...] } or { all: true }" });
             }
             if (targets.some((k) => !k.startsWith(`${userId}/`) || k.includes(".."))) {
-                return res.status(403).json({ message: "You can only index your own files" });
+                return res.status(403).json({ message: "You can only index files in this knowledge base" });
             }
             const remaining = Math.max(0, targets.length - MAX_INDEX_PER_REQUEST);
             targets = targets.slice(0, MAX_INDEX_PER_REQUEST);
@@ -104,28 +108,29 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
             return res.status(200).json({ indexed, failed: results.length - indexed, remaining, results });
         }));
 
-        this.router.delete("/delete", this.asyncHandler(async (req, res, next) => {
-            try {
-                console.log(req.body.keys);
-                const keys = req.body.keys;
-                if (!Array.isArray(keys) || keys.length < 1 || !keys.every(key => typeof key === 'string')) {
-                    return res.status(400).json({ message: "keys must be a non-empty array of strings" });
-                }
-                await this.service.delete(keys);
-                try {
-                    await this.embedder.deleteBySourceFiles(keys);
-                    return res.status(201).json({"message":"Deleted Successfully"});
-                } catch (cleanupError) {
-                    console.error(`[delete] failed to clean up vectors for keys:`, keys, cleanupError);
-                    next(cleanupError);
-                }
-            } catch (e) {
-
+        // Deletes files (and their search index) from the active knowledge
+        // base. Only keys inside that folder are accepted; in a team
+        // workspace only admins and the owner may delete.
+        this.router.delete("/delete", this.asyncHandler(async (req, res) => {
+            const keys = req.body?.keys;
+            if (!Array.isArray(keys) || keys.length < 1 || keys.length > 1000 || !keys.every((key) => typeof key === "string")) {
+                return res.status(400).json({ message: "keys must be a non-empty array of strings" });
             }
-
-
-
-
+            const prefix = `${kbScope(req)}/`;
+            if (keys.some((k: string) => !k.startsWith(prefix) || k.length === prefix.length || k.includes(".."))) {
+                return res.status(403).json({ message: "You can only delete files in this knowledge base" });
+            }
+            if (req.workspace && req.workspace.role === "member") {
+                return res.status(403).json({ message: "Only workspace admins can delete shared files" });
+            }
+            await this.service.delete(keys);
+            try {
+                await this.embedder.deleteBySourceFiles(keys);
+            } catch (cleanupError) {
+                // The files are gone; stale search entries are dropped on the next re-index.
+                console.error(`[delete] failed to clean up vectors for keys:`, keys, cleanupError);
+            }
+            return res.status(200).json({ message: "Deleted successfully" });
         }))
 
         this.router.post(
@@ -133,7 +138,7 @@ export class StorageRoutes extends BaseRouter<IFileStore> {
             upload.array("files"),
             this.asyncHandler(async (req, res, next) => {
                 try {
-                    const prefix = `${req.user?.sub}/`;
+                    const prefix = `${kbScope(req)}/`;
                     const files = (req.files as Express.Multer.File[] | undefined) ?? [];
                     if (!files.length) {
                         throw new Error("no files provided");

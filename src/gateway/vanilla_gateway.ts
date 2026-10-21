@@ -1,4 +1,5 @@
 import express from "express";
+import { workspaceContext } from "../core/workspaces/workspace_context";
 import http from "http";
 import cors from "cors";
 import helmet from "helmet";
@@ -101,6 +102,8 @@ export class VGateway {
         for (const { path, router } of this.publicRouters) this.app.use(path, router);
         this.app.use(verifyToken);
         this.app.use(userContext());
+        // Which workspace the request acts in (X-Workspace-Id; none = personal).
+        this.app.use(workspaceContext());
         // Per-user limits (shared across processes when REDIS_URL is set).
         this.app.use(apiRateLimit());
         this.app.use("/api/chat_stream", chatRateLimit());

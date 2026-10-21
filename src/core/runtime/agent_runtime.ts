@@ -72,7 +72,7 @@ export class AgentRuntime {
         if (!(await this.deps.messageService.isSessionValid(String(req.sessionId), req.userId))) {
             throw new SessionValidationError();
         }
-        const input = this.deps.kb && req.input ? await withAttachmentText(req.input, req.userId, this.deps.kb) : req.input;
+        const input = this.deps.kb && req.input ? await withAttachmentText(req.input, req.kbScope ?? req.userId, this.deps.kb) : req.input;
         const target = await this.resolveTarget(req);
         if ("blocked" in target) return target;
         const runId = randomUUID();
@@ -125,13 +125,13 @@ export class AgentRuntime {
         if (this.deps.agents) {
             const agent = await this.deps.agents.agentForSession(sessionId, userId, req.agentId);
             if (agent) {
-                const { llm, model } = await this.deps.agents.resolveLLM(agent);
+                const { llm, model } = await this.deps.agents.resolveLLM(agent, userId);
                 return { kind: "agent", llm, model, run: await this.deps.agents.buildRun(agent), agentId: agent.id };
             }
         }
 
         const { llm, model } = await this.resolveChatModel(req);
-        return { kind: "chat", llm, model };
+        return { kind: "chat", llm, model, ...(req.kbScope ? { run: { kbScope: req.kbScope } } : {}) };
     }
 
     // Only models configured for the server, or on the user's own key — a

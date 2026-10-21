@@ -22,6 +22,10 @@ export type McpToolInfo = {
 export type InstructionFile = { name: string; content: string; enabled: boolean };
 
 export type AgentRow = {
+    // null = the creator's personal agent; otherwise shared with that workspace.
+    workspace_id: string | null;
+    // Set by access queries: the caller's role in the agent's workspace.
+    my_role?: "owner" | "admin" | "member" | null;
     id: string;
     user_id: string;
     name: string;
@@ -128,35 +132,52 @@ export type ScheduleInput = Pick<AgentScheduleRow, "name" | "prompt" | "frequenc
 
 const json = (v: unknown) => JSON.stringify(v ?? []);
 
-// All SQL for agents. Every read and write is scoped to the owning user.
+// All SQL for agents. A personal agent (workspace_id NULL) is its creator's
+// alone; a workspace agent is usable by every member of that workspace and
+// editable by its creator or the workspace's owner/admins. Those rules are
+// part of each query, so a check can't be forgotten by a caller.
+const ACCESS = `((a.workspace_id IS NULL AND a.user_id = $2) OR m.user_id IS NOT NULL)`;
+const MEMBER_JOIN = `LEFT JOIN workspace_members m ON m.workspace_id = a.workspace_id AND m.user_id = $2`;
+const CAN_EDIT = `((agents.workspace_id IS NULL AND agents.user_id = $2)
+    OR (agents.workspace_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM workspace_members wm WHERE wm.workspace_id = agents.workspace_id AND wm.user_id = $2
+          AND (wm.role IN ('owner', 'admin') OR agents.user_id = $2))))`;
 export class AgentRepository {
     constructor(private db: IDatabaseAdapter) {}
 
     // ── agents ──
-    async listAgents(userId: string): Promise<(AgentRow & { function_count: number; mcp_count: number; code_function_count: number; schedule_count: number })[]> {
+    // The agents of one space: the user's personal ones (workspaceId null) or
+    // a workspace's shared ones (only if the user is a member).
+    async listAgents(userId: string, workspaceId: string | null = null): Promise<(AgentRow & { function_count: number; mcp_count: number; code_function_count: number; schedule_count: number; creator_name: string | null })[]> {
         const { rows } = await this.db.query(
-            `SELECT a.*,
+            `SELECT a.*, m.role AS my_role, c.display_name AS creator_name,
                     (SELECT count(*)::int FROM agent_functions f WHERE f.agent_id = a.id) AS function_count,
-                    (SELECT count(*)::int FROM agent_mcp_servers m WHERE m.agent_id = a.id) AS mcp_count,
-                    (SELECT count(*)::int FROM agent_code_functions c WHERE c.agent_id = a.id) AS code_function_count,
-                    (SELECT count(*)::int FROM agent_schedules s WHERE s.agent_id = a.id AND s.enabled) AS schedule_count
-             FROM agents a WHERE a.user_id = $1 ORDER BY a.updated_at DESC`,
-            [userId]
+                    (SELECT count(*)::int FROM agent_mcp_servers s WHERE s.agent_id = a.id) AS mcp_count,
+                    (SELECT count(*)::int FROM agent_code_functions cf WHERE cf.agent_id = a.id) AS code_function_count,
+                    (SELECT count(*)::int FROM agent_schedules sc WHERE sc.agent_id = a.id AND sc.enabled) AS schedule_count
+             FROM agents a ${MEMBER_JOIN}
+             LEFT JOIN workspace_members c ON c.workspace_id = a.workspace_id AND c.user_id = a.user_id
+             WHERE ${workspaceId ? "a.workspace_id = $1 AND m.user_id IS NOT NULL" : "a.workspace_id IS NULL AND a.user_id = $2 AND $1::text IS NULL"}
+             ORDER BY a.updated_at DESC`,
+            [workspaceId, userId]
         );
         return rows;
     }
 
+    // An agent the user may use: their own personal one, or one in a
+    // workspace they belong to. (Callers across the app rely on this.)
     async getAgent(id: string, userId: string): Promise<AgentRow | null> {
-        const { rows } = await this.db.query<AgentRow>(`SELECT * FROM agents WHERE id = $1 AND user_id = $2`, [id, userId]);
+        const { rows } = await this.db.query<AgentRow>(
+            `SELECT a.*, m.role AS my_role FROM agents a ${MEMBER_JOIN} WHERE a.id = $1 AND ${ACCESS}`, [id, userId]);
         return rows[0] ?? null;
     }
 
-    async createAgent(userId: string, a: AgentInput): Promise<AgentRow> {
+    async createAgent(userId: string, a: AgentInput, workspaceId: string | null = null): Promise<AgentRow> {
         const { rows } = await this.db.query<AgentRow>(
-            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids, helper_agent_ids)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
+            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids, helper_agent_ids, workspace_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
             [randomUUID(), userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
-             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files), a.skill_mode ?? "all", json(a.skill_ids ?? []), json(a.helper_agent_ids ?? [])]
+             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files), a.skill_mode ?? "all", json(a.skill_ids ?? []), json(a.helper_agent_ids ?? []), workspaceId]
         );
         return rows[0];
     }
@@ -167,7 +188,7 @@ export class AgentRepository {
                     builtin_tools=$9, document_keys=$10, starters=$11, instruction_files=$12,
                     skill_mode=COALESCE($13, skill_mode), skill_ids=COALESCE($14::jsonb, skill_ids),
                     helper_agent_ids=COALESCE($15::jsonb, helper_agent_ids), updated_at=now()
-             WHERE id=$1 AND user_id=$2 RETURNING *`,
+             WHERE id=$1 AND ${CAN_EDIT} RETURNING *`,
             [id, userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
              json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files),
              a.skill_mode ?? null, a.skill_ids ? json(a.skill_ids) : null, a.helper_agent_ids ? json(a.helper_agent_ids) : null]
@@ -178,7 +199,7 @@ export class AgentRepository {
     // Functions, MCP servers, schedules and runs go with it (ON DELETE CASCADE);
     // its chats stay, unlinked from the agent.
     async deleteAgent(id: string, userId: string): Promise<boolean> {
-        const r = await this.db.query(`DELETE FROM agents WHERE id=$1 AND user_id=$2`, [id, userId]);
+        const r = await this.db.query(`DELETE FROM agents WHERE id=$1 AND ${CAN_EDIT}`, [id, userId]);
         return r.rowCount > 0;
     }
 

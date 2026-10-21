@@ -45,6 +45,20 @@ export function webhookRateLimit(): RequestHandler {
     });
 }
 
+// Opening / accepting workspace invite links: slows down token guessing
+// (on top of 24-byte random tokens), per account, shared across servers.
+export function workspaceJoinRateLimit(): RequestHandler {
+    return rateLimit({
+        windowMs: 10 * 60_000,
+        limit: num("WORKSPACE_JOIN_PER_10MIN", 30),
+        keyGenerator: keyFor,
+        standardHeaders: "draft-8",
+        legacyHeaders: false,
+        store: store("wsjoin"),
+        message: { message: "Too many attempts — try again in a few minutes." },
+    });
+}
+
 // Model calls are the expensive part (seconds and real money each), so they
 // get their own, much lower limit.
 export function chatRateLimit(): RequestHandler {

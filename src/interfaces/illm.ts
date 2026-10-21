@@ -15,6 +15,9 @@ export type ChatRunOptions = {
     tools?: ToolSource;        // replaces the default tool registry
     codeInterpreter?: boolean; // OpenAI hosted code interpreter (default: env setting)
     skillScope?: { mode: "all" | "selected" | "none"; ids: string[] }; // which skills the agent may load
+    // Knowledge-base folder the tools search: a workspace's shared one
+    // ("ws_<id>") or, when unset, the chatting user's own.
+    kbScope?: string;
 };
 
 

@@ -12,6 +12,8 @@ export interface ToolContext {
     userId?: string;
     // The chat the tool runs in (e.g. to attach a created document to it).
     sessionId?: string;
+    // Knowledge-base folder to use instead of the user's own (team workspace).
+    kbScope?: string;
 }
 
 export interface ToolDefinition {

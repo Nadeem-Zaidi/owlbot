@@ -1,11 +1,13 @@
 import { ModelRegistry } from "../model_registry";
 import { EmailService, MAX_RECIPIENTS, normalizeRecipients } from "../../infra/email";
+import type { Membership, WorkspaceService } from "../../core/workspaces/workspace_service";
+import { kbScopeFor } from "../../core/workspaces/workspace_service";
 import { ToolDefinition } from "../../types/type";
 import Anthropic from "@anthropic-ai/sdk";
 import OpenAI from "openai";
 import { ChatRunOptions, ILLM } from "../../interfaces/illm";
 import { IVectorDb } from "../../interfaces/vectordb/ivector";
-import { LLMProvider } from "../../llms/llm_factory";
+import { LLMProvider, PROVIDER_LABELS } from "../../llms/llm_factory";
 import {
     AgentCodeFunctionRow, AgentFunctionRow, AgentInput, AgentMcpServerRow, AgentRepository, AgentRow, AgentScheduleRow, CodeFunctionInput, CodeSecret,
     FunctionHeader, FunctionInput, FunctionParam, InstructionFile, McpToolInfo, ScheduleInput,
@@ -56,9 +58,15 @@ type Deps = {
     alwaysTools?: ToolDefinition[];
     // Outgoing email (schedules can email their result). Optional: off when SMTP isn't set up.
     email?: EmailService;
+    // Team workspaces (audit log of agents created/deleted there). Optional.
+    workspaces?: WorkspaceService;
 };
 
-const PROVIDER_LABELS: Record<string, string> = { openai: "ChatGPT", anthropic: "Claude" };
+// Personal agents: the creator. Workspace agents: the creator, or the
+// workspace's owner/admins. (The SQL enforces the same rule on write.)
+export const canEditAgent = (a: Pick<AgentRow, "workspace_id" | "user_id" | "my_role">, userId: string) =>
+    a.workspace_id ? a.user_id === userId || a.my_role === "owner" || a.my_role === "admin" : a.user_id === userId;
+
 const NAME_RE = /^[a-zA-Z][a-zA-Z0-9_]{0,63}$/;
 const METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 const PARAM_TYPES = new Set(["string", "number", "integer", "boolean"]);
@@ -106,13 +114,17 @@ export class AgentService {
 
     // ── agents ──
     // The gallery only needs file names, not their (possibly long) contents.
-    async list(userId: string) {
-        const agents = await this.deps.repo.listAgents(userId);
-        return agents.map((a) => ({ ...a, instruction_files: a.instruction_files.map((f) => ({ ...f, content: "" })) }));
+    async list(userId: string, workspace: Membership | null = null) {
+        const agents = await this.deps.repo.listAgents(userId, workspace?.id ?? null);
+        return agents.map(({ my_role, ...a }) => ({
+            ...a, can_edit: canEditAgent({ ...a, my_role }, userId),
+            instruction_files: a.instruction_files.map((f) => ({ ...f, content: "" })),
+        }));
     }
 
     async get(userId: string, id: string) {
-        const agent = await this.requireAgent(userId, id);
+        const { my_role, ...agent } = await this.requireAgent(userId, id);
+        const can_edit = canEditAgent({ ...agent, my_role }, userId);
         const [functions, servers, schedules, codeFunctions] = await Promise.all([
             this.deps.repo.listFunctions(id),
             this.deps.repo.listMcpServers(id),
@@ -121,6 +133,7 @@ export class AgentService {
         ]);
         return {
             ...agent,
+            can_edit,
             functions: functions.map(functionDto),
             codeFunctions: codeFunctions.map(codeFunctionDto),
             mcpServers: servers.map(mcpDto),
@@ -128,22 +141,28 @@ export class AgentService {
         };
     }
 
-    async create(userId: string, body: any): Promise<AgentRow> {
-        return this.deps.repo.createAgent(userId, await this.validateAgent(userId, body));
+    // Created in the active space: a workspace (shared with its members) or personal.
+    async create(userId: string, body: any, workspace: Membership | null = null): Promise<AgentRow> {
+        const wsId = workspace?.id ?? null;
+        const agent = await this.deps.repo.createAgent(userId, await this.validateAgent(userId, body, wsId), wsId);
+        if (wsId) await this.deps.workspaces?.record(wsId, userId, "agent.created", agent.id, { name: agent.name });
+        return agent;
     }
 
     async update(userId: string, id: string, body: any): Promise<AgentRow> {
-        await this.requireAgent(userId, id);
+        const current = await this.requireEditable(userId, id);
         if (Array.isArray(body?.helper_agent_ids) && body.helper_agent_ids.includes(id)) throw new AgentError("An agent can't ask itself");
-        const updated = await this.deps.repo.updateAgent(id, userId, await this.validateAgent(userId, body));
+        const updated = await this.deps.repo.updateAgent(id, userId, await this.validateAgent(userId, body, current.workspace_id));
         if (!updated) throw new AgentError("Agent not found", 404);
         return updated;
     }
 
     async remove(userId: string, id: string): Promise<void> {
+        const agent = await this.requireEditable(userId, id);
         const servers = await this.deps.repo.listMcpServers(id);
         if (!(await this.deps.repo.deleteAgent(id, userId))) throw new AgentError("Agent not found", 404);
         servers.forEach((s) => this.mcpPool.drop(s.id));
+        if (agent.workspace_id) await this.deps.workspaces?.record(agent.workspace_id, userId, "agent.deleted", id, { name: agent.name });
     }
 
     // Checks an agent body without saving it (Agent Studio validates every
@@ -158,7 +177,15 @@ export class AgentService {
         return agent;
     }
 
-    private async validateAgent(userId: string, b: any): Promise<AgentInput> {
+    // Changing an agent (or its tools, connections, schedules) needs edit rights.
+    private async requireEditable(userId: string, id: string): Promise<AgentRow> {
+        const agent = await this.requireAgent(userId, id);
+        if (!canEditAgent(agent, userId)) throw new AgentError("Only the agent's creator or a workspace admin can change it", 403);
+        return agent;
+    }
+
+    // workspaceId: the space the agent lives in (null = personal).
+    private async validateAgent(userId: string, b: any, workspaceId: string | null = null): Promise<AgentInput> {
         const name = str(b?.name, 60, "Name", true);
         const icon = str(b?.icon, 8, "Icon") || "🤖";
         const description = str(b?.description, 300, "Description");
@@ -166,6 +193,9 @@ export class AgentService {
 
         let provider: string | null = typeof b?.provider === "string" && b.provider ? b.provider : null;
         let model: string | null = typeof b?.model === "string" && b.model ? b.model : null;
+        // A shared agent runs for every member, billed to whoever is chatting;
+        // someone's personal API key can't be used for that.
+        if (workspaceId && provider?.startsWith("key:")) throw new AgentError("Team agents can't use a personal API key — pick one of the app's models");
         if (provider && this.deps.registry) {
             // Accepts the server's providers and the user's own keys ("key:<id>").
             await this.deps.registry.validateChoice(userId, provider, model).catch((err) => {
@@ -184,7 +214,8 @@ export class AgentService {
         const unknown = builtin_tools.filter((t) => !BUILTIN_TOOL_IDS.has(t));
         if (unknown.length) throw new AgentError(`Unknown built-in tools: ${unknown.join(", ")}`);
 
-        const prefix = `${userId}/`;
+        // Documents from the same space's knowledge base (the team's in a workspace).
+        const prefix = `${kbScopeFor(workspaceId, userId)}/`;
         const document_keys = Array.isArray(b?.document_keys)
             ? [...new Set<string>(b.document_keys.filter((k: unknown) => typeof k === "string" && k.startsWith(prefix) && !k.includes("..")))]
             : [];
@@ -210,7 +241,9 @@ export class AgentService {
             const ids = Array.isArray(b.helper_agent_ids) ? [...new Set<string>(b.helper_agent_ids.filter((x: unknown) => typeof x === "string"))] : [];
             if (ids.length > MAX_HELPERS) throw new AgentError(`An agent can ask at most ${MAX_HELPERS} other agents`);
             for (const id of ids) {
-                if (!(await this.deps.repo.getAgent(id, userId))) throw new AgentError("A helper agent wasn't found — pick from your agents");
+                const helper = await this.deps.repo.getAgent(id, userId);
+                // Same space only, so a personal agent can't be exposed to a team (or the reverse).
+                if (!helper || (helper.workspace_id ?? null) !== workspaceId) throw new AgentError("A helper agent wasn't found — pick from the agents in this space");
             }
             helper_agent_ids = ids;
         }
@@ -314,13 +347,13 @@ export class AgentService {
 
     // ── HTTP functions ──
     async createFunction(userId: string, agentId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const input = await this.validateFunction(agentId, body, null);
         return functionDto(await this.deps.repo.createFunction(agentId, input));
     }
 
     async updateFunction(userId: string, agentId: string, fnId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const existing = await this.deps.repo.getFunction(agentId, fnId);
         if (!existing) throw new AgentError("Function not found", 404);
         const input = await this.validateFunction(agentId, body, existing);
@@ -328,14 +361,14 @@ export class AgentService {
     }
 
     async deleteFunction(userId: string, agentId: string, fnId: string) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         if (!(await this.deps.repo.deleteFunction(agentId, fnId))) throw new AgentError("Function not found", 404);
     }
 
     // Runs a function with sample arguments, without saving anything. For a
     // saved function, masked secret headers keep their stored values.
     async testFunction(userId: string, agentId: string, body: any): Promise<HttpCallResult> {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const existing = typeof body?.functionId === "string" ? await this.deps.repo.getFunction(agentId, body.functionId) : null;
         const fn = this.normalizeFunction(body?.function ?? {}, existing);
         await assertPublicUrl(fn.url.replace(/\{[^}]+\}/g, "x"));
@@ -413,7 +446,7 @@ export class AgentService {
 
     async createCodeFunction(userId: string, email: string | undefined, agentId: string, body: any) {
         this.requireOwner(email);
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const input = this.normalizeCodeFunction(body, null);
         await this.assertToolNameFree(agentId, input.name);
         return codeFunctionDto(await this.deps.repo.createCodeFunction(agentId, input));
@@ -421,7 +454,7 @@ export class AgentService {
 
     async updateCodeFunction(userId: string, email: string | undefined, agentId: string, fnId: string, body: any) {
         this.requireOwner(email);
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const existing = await this.deps.repo.getCodeFunction(agentId, fnId);
         if (!existing) throw new AgentError("Code function not found", 404);
         const input = this.normalizeCodeFunction({ ...existing, ...body }, existing);
@@ -431,7 +464,7 @@ export class AgentService {
 
     // Deleting is allowed for the agent's owner even if code functions are off.
     async deleteCodeFunction(userId: string, agentId: string, fnId: string) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         if (!(await this.deps.repo.deleteCodeFunction(agentId, fnId))) throw new AgentError("Code function not found", 404);
     }
 
@@ -439,7 +472,7 @@ export class AgentService {
     // secrets keep their stored values.
     async testCodeFunction(userId: string, email: string | undefined, agentId: string, body: any): Promise<RunPythonResult> {
         this.requireOwner(email);
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const existing = typeof body?.functionId === "string" ? await this.deps.repo.getCodeFunction(agentId, body.functionId) : null;
         const fn = this.normalizeCodeFunction(body?.function ?? {}, existing);
         try {
@@ -498,7 +531,7 @@ export class AgentService {
     }
 
     async addMcpServer(userId: string, agentId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const name = str(body?.name, 40, "Server name", true);
         const url = str(body?.url, 2000, "Server URL", true);
         const token = str(body?.token, 4000, "Access token") || null;
@@ -513,7 +546,7 @@ export class AgentService {
 
     // Rename, change URL/token, or switch individual tools on/off.
     async updateMcpServer(userId: string, agentId: string, serverId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const s = await this.deps.repo.getMcpServer(agentId, serverId);
         if (!s) throw new AgentError("MCP server not found", 404);
         const name = body?.name !== undefined ? str(body.name, 40, "Server name", true) : s.name;
@@ -539,7 +572,7 @@ export class AgentService {
 
     // Re-reads the tool list (the server may have added tools); keeps on/off choices.
     async refreshMcpServer(userId: string, agentId: string, serverId: string) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const s = await this.deps.repo.getMcpServer(agentId, serverId);
         if (!s) throw new AgentError("MCP server not found", 404);
         const fresh = await this.discoverMcp({ url: s.url, token: s.auth_token ? decryptSecret(s.auth_token) : null });
@@ -550,21 +583,21 @@ export class AgentService {
     }
 
     async deleteMcpServer(userId: string, agentId: string, serverId: string) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         if (!(await this.deps.repo.deleteMcpServer(agentId, serverId))) throw new AgentError("MCP server not found", 404);
         this.mcpPool.drop(serverId);
     }
 
     // ── schedules ──
     async createSchedule(userId: string, agentId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const input = this.validateSchedule(body);
         const next = input.enabled ? computeNextRun(input) : null;
         return scheduleDto(await this.deps.repo.createSchedule(agentId, userId, input, next));
     }
 
     async updateSchedule(userId: string, agentId: string, scheduleId: string, body: any) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const existing = await this.deps.repo.getSchedule(agentId, scheduleId);
         if (!existing) throw new AgentError("Schedule not found", 404);
         // Only check the server's email setup when email is being turned on now
@@ -575,12 +608,12 @@ export class AgentService {
     }
 
     async deleteSchedule(userId: string, agentId: string, scheduleId: string) {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         if (!(await this.deps.repo.deleteSchedule(agentId, scheduleId))) throw new AgentError("Schedule not found", 404);
     }
 
     async getSchedule(userId: string, agentId: string, scheduleId: string): Promise<AgentScheduleRow> {
-        await this.requireAgent(userId, agentId);
+        await this.requireEditable(userId, agentId);
         const s = await this.deps.repo.getSchedule(agentId, scheduleId);
         if (!s) throw new AgentError("Schedule not found", 404);
         return s;
@@ -626,9 +659,12 @@ export class AgentService {
     // The provider/model an agent uses (falls back to the server default).
     // A provider/key that disappeared (e.g. the user deleted their key) falls
     // back to the server default instead of breaking the agent.
-    async resolveLLM(agent: AgentRow): Promise<{ llm: ILLM; model: string }> {
+    // `forUserId`: who is chatting. A workspace agent runs as (and is billed
+    // to) that person; a personal agent as its creator.
+    async resolveLLM(agent: AgentRow, forUserId?: string): Promise<{ llm: ILLM; model: string }> {
         if (this.deps.registry) {
-            const r = await this.deps.registry.resolve(agent.user_id, agent.provider, agent.model);
+            const runAs = agent.workspace_id && forUserId ? forUserId : agent.user_id;
+            const r = await this.deps.registry.resolve(runAs, agent.provider, agent.model);
             return { llm: r.llm, model: r.model };
         }
         const provider = agent.provider && this.deps.providers.has(agent.provider as LLMProvider)
@@ -665,6 +701,7 @@ export class AgentService {
         return {
             systemPrompt, tools, codeInterpreter: agent.builtin_tools.includes("code_interpreter"),
             skillScope: { mode: agent.skill_mode ?? "all", ids: agent.skill_ids ?? [] },
+            ...(agent.workspace_id ? { kbScope: kbScopeFor(agent.workspace_id, agent.user_id) } : {}),
         };
     }
 
@@ -743,7 +780,7 @@ export class AgentService {
 
     // One non-interactive turn (used by schedules). Returns the reply text.
     async runOnce(agent: AgentRow, userId: string, sessionId: string, prompt: string, signal: AbortSignal): Promise<{ text: string; error: string | null }> {
-        const { llm, model } = await this.resolveLLM(agent);
+        const { llm, model } = await this.resolveLLM(agent, userId);
         const run = await this.buildRun(agent);
         const message: LLMMessage = { type: "message", role: "user", content: [{ type: "text", text: prompt }] };
         const r = await collectReply(llm.chatStream([message], userId, sessionId, process.env.OPENAI_API_KEY ?? "", signal, model, run));
