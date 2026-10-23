@@ -87,6 +87,11 @@ export interface ToolContext {
   sessionId?: string;
   // Knowledge-base folder to use instead of the user's own (team workspace).
   kbScope?: string;
+  // The running answer's Stop signal, and a way to send a live event to the
+  // chat while the tool runs (e.g. a request for the desktop app). Only set
+  // inside a provider's tool loop.
+  signal?: AbortSignal;
+  emit?: (event: Record<string, unknown> & { type: string }) => void;
 }
 
 export interface ToolDefinition {

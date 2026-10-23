@@ -62,6 +62,9 @@ import { NativeBackend } from "./service/native_agents/native_types";
 import { ClaudeNativeBackend } from "./service/native_agents/claude_native";
 import { OpenAINativeBackend } from "./service/native_agents/openai_native";
 import { createNativeAgentRouter } from "./routes/native_agent_routes";
+import { createLocalCommandRouter } from "./routes/local_command_routes";
+import { LocalCommandBroker } from "./core/local_commands/local_command_broker";
+import { createLocalCommandTool } from "./core/local_commands/local_command_tool";
 import { BillingRepository } from "./repository/billing_repository";
 import { BillingService } from "./service/billing/billing_service";
 import { createBillingRouter, createBillingWebhookRouter } from "./routes/billing_routes";
@@ -219,6 +222,8 @@ async function wa() {
     if (memoryEnabled) setContextEngine(new MemoryRecallEngine(contextEngine(), memoryService));
     const agentRepo = new AgentRepository(db);
     // Outgoing email over SMTP (off unless SMTP_HOST is set).
+    // Commands agents ask to run on a user's computer, waiting for the desktop app's answer.
+    const localCommands = new LocalCommandBroker();
     const emailService = new EmailService(db);
     if (emailService.enabled) console.log("[email] SMTP configured");
     // Team workspaces: shared agents and knowledge base, members with roles.
@@ -244,6 +249,8 @@ async function wa() {
         usage: usageRepo,
         registry: modelRegistry,
         alwaysTools: [...artifactTools, ...chartTools, ...memoryTools, ...skillTools, ...documentTools, ...automationTools],
+        // Commands on the user's own computer, through the desktop app (owner only, approved each time).
+        localCommandTool: createLocalCommandTool(localCommands),
     });
     // Provider-native agents (Claude Managed Agents / OpenAI Agents API), for
     // each provider that has an API key.
@@ -428,6 +435,7 @@ async function wa() {
         { path: "/api/search", router: searchRouter },
         { path: "/api/usage", router: usageRouter },
         { path: "/api/native-agents", router: createNativeAgentRouter(nativeAgentService) },
+        { path: "/api/local-commands", router: createLocalCommandRouter(localCommands) },
         { path: "/api/billing", router: createBillingRouter(billing) },
         { path: "/api/llm-keys", router: createLLMKeyRouter(modelRegistry) },
         { path: "/api/artifacts", router: createArtifactRouter(artifactRepo) },

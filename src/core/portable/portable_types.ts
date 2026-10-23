@@ -28,6 +28,8 @@ export type PortableAgent = {
     instruction_files: { name: string; content: string; enabled: boolean }[];
     model: { provider: string; model: string | null } | null;
     builtin_tools: string[];
+    // Budget per answer (max_rounds, max_minutes, max_tokens); older files have none.
+    limits?: Record<string, number>;
     documents: string[];                           // knowledge documents, by name
     // "all" = all of the importer's skills; "selected" = these (created if missing).
     skills: { mode: "all" | "selected" | "none"; items: { name: string; description: string; content: string }[] };

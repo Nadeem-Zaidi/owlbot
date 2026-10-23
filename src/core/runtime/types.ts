@@ -23,6 +23,10 @@ export type RunRequest = {
     nativeAgentId?: string;
     // Knowledge-base folder for plain chats (the active team workspace's).
     kbScope?: string;
+    // Set when the chat runs in the Owl Bot desktop app with local commands
+    // switched on (X-Owl-Desktop header). Only a hint: nothing runs without
+    // the user's approval in the app. `email` is the signed-in user's.
+    localCommands?: { email: string | null; platform: string };
 };
 
 // What a session's turn runs on, after resolving its agent and model.

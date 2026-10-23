@@ -3,6 +3,7 @@ import { InvalidSession, SessionValidationError, ValidationError } from "../../e
 import { ILLM } from "../../interfaces/illm";
 import { LLMProvider } from "../../llms/llm_factory";
 import { AgentService } from "../../service/agents/agent_service";
+import { isOwner } from "../../service/agents/owner";
 import { withAttachmentText } from "../../service/attachment_text";
 import { KnowledgeBase } from "../../service/knowledge_base";
 import { MessageService } from "../../service/message_service";
@@ -126,7 +127,11 @@ export class AgentRuntime {
             const agent = await this.deps.agents.agentForSession(sessionId, userId, req.agentId);
             if (agent) {
                 const { llm, model } = await this.deps.agents.resolveLLM(agent, userId);
-                return { kind: "agent", llm, model, run: await this.deps.agents.buildRun(agent), agentId: agent.id };
+                // Local commands: a live chat in the desktop app, on the owner's own
+                // personal agent, by an app owner (OWNER_EMAILS) — never otherwise.
+                const local = req.channel === "web" && req.localCommands && agent.user_id === userId && !agent.workspace_id && isOwner(req.localCommands.email);
+                const run = await this.deps.agents.buildRun(agent, local ? { localCommands: { platform: req.localCommands!.platform } } : {});
+                return { kind: "agent", llm, model, run, agentId: agent.id };
             }
         }
 

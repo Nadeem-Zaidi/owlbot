@@ -22,6 +22,9 @@ export const BUILTIN_TOOLS = [
     { id: "list_documents", label: "List documents", description: "Lets the agent see which documents it can use." },
     { id: "current_datetime", label: "Current date & time", description: "For anything time-sensitive (deadlines, “today”)." },
     { id: "code_interpreter", label: "Code interpreter", description: "Runs Python for maths and data. ChatGPT models only." },
+    // Added to the agent only in its owner's live chat in the desktop app
+    // (AgentService.buildRun); the user approves every command there.
+    { id: "run_local_command", label: "Run local commands (desktop app)", description: "Runs shell commands on your own computer, each approved by you in the Owl Bot desktop app.", desktopOnly: true },
 ] as const;
 
 export type BuiltinToolId = (typeof BUILTIN_TOOLS)[number]["id"];

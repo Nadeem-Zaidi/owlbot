@@ -1,5 +1,6 @@
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ToolLoopGuard } from "./tool_loop_guard";
+import { runTool } from "./tool_runner";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
 import { LLMConfig } from "../types/lmconfig";
@@ -261,7 +262,7 @@ export class OpenAICompatibleProvider implements ILLM {
         let sendMaxTokens = true;
 
         // Ends runaway tool use with one final, tool-less answer.
-        const guard = new ToolLoopGuard();
+        const guard = new ToolLoopGuard(run?.limits);
         let wrapUpSent = false;
 
         for (;;) {
@@ -320,6 +321,7 @@ export class OpenAICompatibleProvider implements ILLM {
             }
 
             if (turn.usage) {
+                guard.addTokens(turn.usage.input_tokens + turn.usage.output_tokens);
                 const inc = usageIncrement(turn.usage, turn.model ?? activeModel);
                 yield (turn.cost !== undefined ? { ...inc, cost_usd: turn.cost } : inc) as LLMMessage;
             }
@@ -363,7 +365,7 @@ export class OpenAICompatibleProvider implements ILLM {
 
                 let result: string;
                 try {
-                    const output = await toolset.executeTool(call.function.name, args, { db, userId, sessionId, kbScope: run?.kbScope });
+                    const output = yield* runTool(toolset, call.function.name, args, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
                     result = typeof output === "string" ? output : JSON.stringify(output);
                     yield { type: "function_call_output", tool_call_id: call.id, output: result } as LLMMessage;
                     guard.record(call.function.name, result);

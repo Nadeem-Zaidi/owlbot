@@ -1,3 +1,4 @@
+import { LOCAL_COMMAND_TOOL } from "../local_commands/local_command_tool";
 import { AgentRepository, AgentRow } from "../../repository/agent_repository";
 import { AgentService } from "../../service/agents/agent_service";
 import { KnowledgeBase } from "../../service/knowledge_base";
@@ -109,6 +110,7 @@ export class PortableService {
             instruction_files: (a.instruction_files ?? []).map((f: any) => ({ name: f.name, content: f.content, enabled: f.enabled !== false })),
             model: a.provider ? { provider: a.provider, model: a.model ?? null } : null,
             builtin_tools: a.builtin_tools ?? [],
+            limits: a.limits ?? {},
             documents: (a.document_keys ?? []).map(fileName),
             skills: { mode: a.skill_mode ?? "all", items },
             functions: (a.functions ?? []).map((f: any): PortableFunction => ({
@@ -160,7 +162,9 @@ export class PortableService {
                 starters: arr<string>(a.starters, 6).filter((s) => typeof s === "string"),
                 instruction_files: arr(a.instruction_files, 10).map((x: any) => ({ name: str(x?.name, 100), content: str(x?.content, 100_000), enabled: x?.enabled !== false })),
                 model: a.model && typeof a.model.provider === "string" ? { provider: str(a.model.provider, 80), model: typeof a.model.model === "string" ? str(a.model.model, 200) : null } : null,
-                builtin_tools: arr<string>(a.builtin_tools, 20).filter((t) => typeof t === "string"),
+                // Never imported: local commands run on the importer's computer, so they turn it on themselves.
+                builtin_tools: arr<string>(a.builtin_tools, 20).filter((t) => typeof t === "string" && t !== LOCAL_COMMAND_TOOL),
+                limits: a.limits && typeof a.limits === "object" && !Array.isArray(a.limits) ? a.limits : {},
                 documents: arr<string>(a.documents, 200).filter((d) => typeof d === "string").map((d) => d.slice(0, 300)),
                 skills: {
                     mode: ["all", "selected", "none"].includes(a?.skills?.mode) ? a.skills.mode : "all",
@@ -249,6 +253,7 @@ export class PortableService {
                 name: a.name, icon: a.icon, description: a.description, instructions: a.instructions, starters: a.starters,
                 instruction_files: a.instruction_files, provider: model?.provider ?? null, model: model?.model ?? null,
                 builtin_tools: a.builtin_tools, document_keys, skill_mode: a.skills.mode, skill_ids: [],
+                ...(a.limits && Object.keys(a.limits).length ? { limits: a.limits } : {}),
             };
             await this.deps.agents.checkInput(userId, body).catch(async (err) => {
                 // A model the server rejects → fall back to the default model.

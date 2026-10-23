@@ -1,3 +1,4 @@
+import { RunLimits } from "../llms/tool_loop_guard";
 import { LLMMessage, Tool, ToolCall } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
 import { ToolContext, ToolDefinition } from "../types/type";
@@ -18,6 +19,8 @@ export type ChatRunOptions = {
     // Knowledge-base folder the tools search: a workspace's shared one
     // ("ws_<id>") or, when unset, the chatting user's own.
     kbScope?: string;
+    // The agent's own budget for one answer (rounds, minutes, tokens).
+    limits?: RunLimits;
 };
 
 

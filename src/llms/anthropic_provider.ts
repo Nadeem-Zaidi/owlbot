@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ToolLoopGuard } from "./tool_loop_guard";
+import { runTool } from "./tool_runner";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
@@ -304,7 +305,7 @@ export class AnthropicProvider implements ILLM {
         const collectedSources = new Set<string>();
         let jsonRetries = 0;
         // Ends runaway tool use with one final, tool-less answer.
-        const guard = new ToolLoopGuard();
+        const guard = new ToolLoopGuard(run?.limits);
         let wrapUpSent = false;
 
         while (true) {
@@ -348,7 +349,9 @@ export class AnthropicProvider implements ILLM {
 
                 message = await stream.finalMessage();
                 jsonRetries = 0;
-                yield usageIncrement(anthropicUsage(message.usage), message.model);
+                const roundUsage = anthropicUsage(message.usage);
+                guard.addTokens(roundUsage.input_tokens + roundUsage.output_tokens);
+                yield usageIncrement(roundUsage, message.model);
             } catch (err) {
                 const errorChunk = this.toErrorChunk(err, signal);
                 // finalMessage() rejects with a plain (non-API) error when a
@@ -452,7 +455,7 @@ export class AnthropicProvider implements ILLM {
                     const invalid = this.validateToolInput(toolset, toolUse.name, args);
                     if (invalid) throw new Error(`Invalid arguments for "${toolUse.name}": ${invalid}`);
 
-                    const toolOutput = await toolset.executeTool(toolUse.name, args, { db, userId, sessionId, kbScope: run?.kbScope });
+                    const toolOutput = yield* runTool(toolset, toolUse.name, args, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                     yield { type: "function_call_output", tool_call_id: toolUse.id, output: result } as LLMMessage;
                     guard.record(toolUse.name, result);

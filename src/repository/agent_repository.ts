@@ -43,6 +43,8 @@ export type AgentRow = {
     skill_ids: string[];
     // Agents this one can ask for help (each becomes an ask_… tool).
     helper_agent_ids: string[];
+    // Budget for one answer; unset fields use the defaults (see ToolLoopGuard).
+    limits: AgentLimits;
     created_at: Date;
     updated_at: Date;
 };
@@ -124,9 +126,11 @@ export type AgentRunRow = {
     finished_at: Date | null;
 };
 
+export type AgentLimits = { max_rounds?: number; max_minutes?: number; max_tokens?: number };
+
 export type AgentInput = Pick<AgentRow, "name" | "icon" | "description" | "instructions" | "provider" | "model" | "builtin_tools" | "document_keys" | "starters" | "instruction_files">
-    // Omitted (older clients) → unchanged on update, "all" on create.
-    & { skill_mode?: AgentRow["skill_mode"]; skill_ids?: string[]; helper_agent_ids?: string[] };
+    // Omitted (older clients) → unchanged on update, "all"/none on create.
+    & { skill_mode?: AgentRow["skill_mode"]; skill_ids?: string[]; helper_agent_ids?: string[]; limits?: AgentLimits };
 export type FunctionInput = Pick<AgentFunctionRow, "name" | "description" | "method" | "url" | "parameters" | "headers" | "enabled">;
 export type ScheduleInput = Pick<AgentScheduleRow, "name" | "prompt" | "frequency" | "interval_hours" | "time_of_day" | "weekday" | "timezone" | "deliver_whatsapp" | "deliver_email" | "email_to" | "enabled">;
 
@@ -174,10 +178,11 @@ export class AgentRepository {
 
     async createAgent(userId: string, a: AgentInput, workspaceId: string | null = null): Promise<AgentRow> {
         const { rows } = await this.db.query<AgentRow>(
-            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids, helper_agent_ids, workspace_id)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+            `INSERT INTO agents (id, user_id, name, icon, description, instructions, provider, model, builtin_tools, document_keys, starters, instruction_files, skill_mode, skill_ids, helper_agent_ids, workspace_id, limits)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
             [randomUUID(), userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
-             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files), a.skill_mode ?? "all", json(a.skill_ids ?? []), json(a.helper_agent_ids ?? []), workspaceId]
+             json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files), a.skill_mode ?? "all", json(a.skill_ids ?? []), json(a.helper_agent_ids ?? []), workspaceId,
+             JSON.stringify(a.limits ?? {})]
         );
         return rows[0];
     }
@@ -187,11 +192,12 @@ export class AgentRepository {
             `UPDATE agents SET name=$3, icon=$4, description=$5, instructions=$6, provider=$7, model=$8,
                     builtin_tools=$9, document_keys=$10, starters=$11, instruction_files=$12,
                     skill_mode=COALESCE($13, skill_mode), skill_ids=COALESCE($14::jsonb, skill_ids),
-                    helper_agent_ids=COALESCE($15::jsonb, helper_agent_ids), updated_at=now()
+                    helper_agent_ids=COALESCE($15::jsonb, helper_agent_ids), limits=COALESCE($16::jsonb, limits), updated_at=now()
              WHERE id=$1 AND ${CAN_EDIT} RETURNING *`,
             [id, userId, a.name, a.icon, a.description, a.instructions, a.provider, a.model,
              json(a.builtin_tools), json(a.document_keys), json(a.starters), json(a.instruction_files),
-             a.skill_mode ?? null, a.skill_ids ? json(a.skill_ids) : null, a.helper_agent_ids ? json(a.helper_agent_ids) : null]
+             a.skill_mode ?? null, a.skill_ids ? json(a.skill_ids) : null, a.helper_agent_ids ? json(a.helper_agent_ids) : null,
+             a.limits ? JSON.stringify(a.limits) : null]
         );
         return rows[0] ?? null;
     }

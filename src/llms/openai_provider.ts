@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { ToolLoopGuard } from "./tool_loop_guard";
+import { runTool } from "./tool_runner";
 import type { ResponseFunctionToolCall, ResponseInputFile, ResponseInputImage, ResponseInputItem, ResponseInputText, ResponseOutputText } from "openai/resources/responses/responses";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool, ToolCall } from "../types/llm_message";
@@ -311,7 +312,7 @@ export class OpenAIProvider implements ILLM {
         let pendingText = "";
 
         // Ends runaway tool use with one final, tool-less answer.
-        const guard = new ToolLoopGuard();
+        const guard = new ToolLoopGuard(run?.limits);
         let wrapUpSent = false;
 
         let continueLoop = true;
@@ -648,7 +649,7 @@ export class OpenAIProvider implements ILLM {
                                         throw new Error(`Model produced invalid JSON arguments for "${item.name}": ${item.arguments}`);
                                     }
 
-                                    const toolOutput = await toolset.executeTool(item.name, parsedArgs, { db, userId, sessionId, kbScope: run?.kbScope });
+                                    const toolOutput = yield* runTool(toolset, item.name, parsedArgs, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
                                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                                     yield {
                                         type: "function_call_output",
@@ -750,7 +751,7 @@ export class OpenAIProvider implements ILLM {
 
                         if (event.type === "response.completed") {
                             sawResponseCompleted = true;
-                            if (event.response?.usage) { roundBilled = true; yield usageIncrement(openaiUsage(event.response.usage), event.response.model ?? activeModel); }
+                            if (event.response?.usage) { roundBilled = true; const u = openaiUsage(event.response.usage); guard.addTokens(u.input_tokens + u.output_tokens); yield usageIncrement(u, event.response.model ?? activeModel); }
                             if (!functionCallTools.size && !mcpCallTools.size) {
                                 if (calledAnyToolThisTurn) {
                                     guard.endRound();

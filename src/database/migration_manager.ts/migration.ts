@@ -1262,6 +1262,17 @@ export const migration_20261024100000: Migration = {
   ]
 };
 
+export const migration_20261025100000: Migration = {
+  version: "20261025100000",
+  description: "Agent budgets: max tool rounds, minutes and tokens per answer",
+  up: [
+    `ALTER TABLE agents ADD COLUMN IF NOT EXISTS limits JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  ],
+  down: [
+    `ALTER TABLE agents DROP COLUMN IF EXISTS limits`,
+  ]
+};
+
 export const migrations: Migration[] = [
 
   migration_20260607120000,
@@ -1295,5 +1306,6 @@ export const migrations: Migration[] = [
   migration_20261021100000,
   migration_20261022100000,
   migration_20261023100000,
-  migration_20261024100000
+  migration_20261024100000,
+  migration_20261025100000
 ];

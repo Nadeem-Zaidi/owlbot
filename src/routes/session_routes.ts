@@ -1,4 +1,5 @@
 import "dotenv/config";  
+import type express from "express";
 import { kbScope } from "../core/workspaces/workspace_context";
 import dotenv from "dotenv";
 import { InvalidSession, SessionValidationError, ValidationError } from "../error_handling/app_error";
@@ -194,6 +195,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 agentId: typeof agentId === "string" ? agentId : undefined,
                 nativeAgentId: typeof nativeAgentId === "string" ? nativeAgentId : undefined,
                 ...(req.workspace ? { kbScope: kbScope(req) } : {}),
+                ...desktopAccess(req),
             });
             void this.billing?.rememberUser(req.user!.sub, req.user!.email);
 
@@ -239,6 +241,9 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 "approval_request",
                 "approval_resolved",
                 "browser_screenshot",
+                // Local commands (desktop app) and keep-alives while a tool runs long.
+                "local_command_request",
+                "heartbeat",
             ]);
 
             for await (const chunk of prepared.stream(abortController.signal)) {
@@ -330,4 +335,14 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
     }
 
+}
+
+// "X-Owl-Desktop: shell; platform=win32" — sent by the Owl Bot desktop app
+// when the user has allowed local commands. Faking it in a browser only
+// makes the tool appear; nothing runs without the app's approval dialog.
+function desktopAccess(req: express.Request): { localCommands?: { email: string | null; platform: string } } {
+    const raw = String(req.headers["x-owl-desktop"] ?? "");
+    if (!/(^|;)\s*shell\s*(;|$)/i.test(raw)) return {};
+    const platform = /platform=(win32|darwin|linux)/i.exec(raw)?.[1]?.toLowerCase() ?? "unknown";
+    return { localCommands: { email: req.user?.email ?? null, platform } };
 }
