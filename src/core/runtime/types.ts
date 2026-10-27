@@ -27,11 +27,13 @@ export type RunRequest = {
     // switched on (X-Owl-Desktop header). Only a hint: nothing runs without
     // the user's approval in the app. `email` is the signed-in user's.
     localCommands?: { email: string | null; platform: string };
+    // Opt-in tool packs the user turned on in this chat ("documents").
+    toolPacks?: string[];
 };
 
 // What a session's turn runs on, after resolving its agent and model.
 export type RunTarget =
-    | { kind: "chat"; llm: ILLM; model: string; run?: { kbScope: string } }
+    | { kind: "chat"; llm: ILLM; model: string; run?: { kbScope?: string; toolPacks?: string[]; systemPrompt?: string } }
     | { kind: "agent"; llm: ILLM; model: string; run: ChatRunOptions; agentId: string }
     | { kind: "native"; llm: ILLM; model: string; run?: undefined; agentId: string };
 

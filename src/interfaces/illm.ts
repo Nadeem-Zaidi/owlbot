@@ -21,6 +21,8 @@ export type ChatRunOptions = {
     kbScope?: string;
     // The agent's own budget for one answer (rounds, minutes, tokens).
     limits?: RunLimits;
+    // Opt-in tool packs turned on for this run ("documents" = Word & Excel).
+    toolPacks?: string[];
 };
 
 

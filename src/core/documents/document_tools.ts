@@ -10,10 +10,15 @@ const receipt = (file: GeneratedFileDto) => ({
     note: "The user gets a download card for this file (and the file itself on WhatsApp/Telegram). Reply in one or two sentences; don't paste the content again.",
 });
 
+// Word & Excel are an opt-in pack: their long tool descriptions are only sent
+// when the user turns it on in the chat, or on the agent.
+export const DOCUMENTS_PACK = "documents";
+
 export function createDocumentTools(docs: DocumentService): ToolDefinition[] {
     return [
         {
             name: "create_word_document",
+            pack: DOCUMENTS_PACK,
             description:
                 "Creates a Word (.docx) file the user can download, with ANY content they ask for — e.g. reports, proposals, letters, resumes/CVs, " +
                 "essays, articles, notes, minutes, policies, manuals, guides, contracts, invoices, lesson plans, study notes, specs, checklists. " +
@@ -49,6 +54,7 @@ export function createDocumentTools(docs: DocumentService): ToolDefinition[] {
         },
         {
             name: "create_excel_file",
+            pack: DOCUMENTS_PACK,
             description:
                 "Creates an Excel (.xlsx) file the user can download, with ANY tabular content — e.g. budgets, expense or sales trackers, invoices, " +
                 "schedules/timetables, inventories, contact lists, project plans, attendance, comparisons, data exports, test cases, price lists. " +

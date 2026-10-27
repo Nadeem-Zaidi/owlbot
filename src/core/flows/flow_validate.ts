@@ -1,10 +1,13 @@
-import { Branch, Flow, FlowEdge, FlowNode, Route, Rule, RuleOp } from "./flow_types";
+import { Branch, Flow, FlowEdge, FlowNode, ParallelBranch, Route, Rule, RuleOp } from "./flow_types";
 import { FIELD_RE, firstNumber, listValues, numberRange, safeRegex } from "./flow_rules";
 
 export const MAX_FLOW_NODES = 30;
 export const MAX_ROUTES = 10;
 export const MAX_RULES_PER_ROUTE = 10;
+export const MAX_PARALLEL_BRANCHES = 5;
 const ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+// What a condition/router can look at: previous, input, node.<id> or node.<id>.<branch id>.
+const SOURCE_RE = /^(previous|input|node\.[A-Za-z0-9_-]{1,40}(\.[A-Za-z0-9_-]{1,40})?)$/;
 const BRANCH_RE = /^(true|false|approved|rejected|default|route:[A-Za-z0-9_-]{1,40})$/;
 const RULE_OPS: RuleOp[] = [
     "contains", "not_contains", "equals", "matches", "starts_with", "ends_with", "one_of",
@@ -69,6 +72,28 @@ function validateRoutes(raw: unknown, mode: "rule" | "ai", name: string): Route[
     });
 }
 
+// A parallel step's agents: 2 to MAX_PARALLEL_BRANCHES, each with a unique id and name.
+async function validateBranches(raw: unknown, name: string, agentExists: (kind: "agent" | "native", id: string) => Promise<boolean>): Promise<ParallelBranch[]> {
+    const list = Array.isArray(raw) ? raw : [];
+    if (list.length < 2) throw new FlowError(`${name}: add at least two agents to run in parallel`);
+    if (list.length > MAX_PARALLEL_BRANCHES) throw new FlowError(`${name}: at most ${MAX_PARALLEL_BRANCHES} agents can run in parallel`);
+    const ids = new Set<string>(), labels = new Set<string>();
+    const branches: ParallelBranch[] = [];
+    for (const [i, b] of list.entries()) {
+        const id = String(b?.id ?? "");
+        if (!ID_RE.test(id) || ids.has(id)) throw new FlowError(`${name}: agent ${i + 1} has an invalid or duplicate id`);
+        ids.add(id);
+        const label = text(b?.label, 40, `${name} agent ${i + 1} name`, true);
+        if (labels.has(label.toLowerCase())) throw new FlowError(`${name}: two agents are called "${label}"`);
+        labels.add(label.toLowerCase());
+        const agent_kind = b?.agent_kind === "native" ? "native" : "agent";
+        const agent_id = String(b?.agent_id ?? "");
+        if (!agent_id || !(await agentExists(agent_kind, agent_id))) throw new FlowError(`${name} → ${label}: choose one of your agents`);
+        branches.push({ id, label, agent_kind, agent_id, instruction: text(b?.instruction, 4000, `${name} → ${label} instruction`) });
+    }
+    return branches;
+}
+
 // Checks and normalizes a workflow from the editor. `agentExists` confirms
 // each agent step points at one of the user's agents.
 export async function validateFlow(raw: any, agentExists: (kind: "agent" | "native", id: string) => Promise<boolean>): Promise<Flow> {
@@ -96,9 +121,12 @@ export async function validateFlow(raw: any, agentExists: (kind: "agent" | "nati
                 nodes.push({ id, type: "agent", position, label, agent_kind, agent_id, instruction: text(n.instruction, 4000, `"${name}" instruction`) });
                 break;
             }
+            case "parallel":
+                nodes.push({ id, type: "parallel", position, label, branches: await validateBranches(n.branches, `"${name}"`, agentExists), require_all: n.require_all !== false });
+                break;
             case "condition": {
                 const source = text(n.source, 60, `"${name}" source`) || "previous";
-                if (!/^(previous|input|node\.[A-Za-z0-9_-]{1,40})$/.test(source)) throw new FlowError(`"${name}": unknown source "${source}"`);
+                if (!SOURCE_RE.test(source)) throw new FlowError(`"${name}": unknown source "${source}"`);
                 if (n.mode === "ai") {
                     nodes.push({ id, type: "condition", position, label, mode: "ai", source, question: text(n.question, 500, `"${name}" question`, true) });
                 } else {
@@ -109,7 +137,7 @@ export async function validateFlow(raw: any, agentExists: (kind: "agent" | "nati
             }
             case "router": {
                 const source = text(n.source, 60, `"${name}" source`) || "previous";
-                if (!/^(previous|input|node\.[A-Za-z0-9_-]{1,40})$/.test(source)) throw new FlowError(`"${name}": unknown source "${source}"`);
+                if (!SOURCE_RE.test(source)) throw new FlowError(`"${name}": unknown source "${source}"`);
                 const mode = n.mode === "ai" ? "ai" : "rule";
                 const routes = validateRoutes(n.routes, mode, `"${name}"`);
                 const instructions = mode === "ai" ? text(n.instructions, 1000, `"${name}" instructions`) : "";

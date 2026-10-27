@@ -6,7 +6,7 @@ import { MessageService } from "../../service/message_service";
 import { NativeAgentService } from "../../service/native_agents/native_agent_service";
 import { metrics } from "../../infra/observability";
 import { conditionSource, evaluateGroup, evaluateOne, parseRoutePick, parseYesNo, renderTemplate, RuleSubject } from "./flow_rules";
-import { Branch, Flow, FlowNode, FlowRunState, FlowTraceEntry, Route } from "./flow_types";
+import { Branch, Flow, FlowNode, FlowRunState, FlowTraceEntry, ParallelBranchTrace, Route } from "./flow_types";
 
 const STEP_TIMEOUT_MS = 5 * 60_000;
 const MAX_TEXT_CHARS = 50_000;     // what one step may hand to the next
@@ -68,20 +68,12 @@ export class FlowRunner {
                         break;
 
                     case "agent": {
-                        const native = node.agent_kind === "native";
-                        const agent = native
-                            ? await this.deps.nativeAgents?.get(userId, node.agent_id).catch(() => null)
-                            : await this.deps.agentRepo.getAgent(node.agent_id, userId);
+                        const agent = await this.loadAgent(userId, node.agent_kind, node.agent_id);
                         if (!agent) throw new FlowStop(`"${entry.label}": the agent was deleted`);
                         const prompt = renderInstruction(node.instruction, state);
                         Object.assign(entry, { kind: node.agent_kind, agent_id: agent.id, agent_name: agent.name, agent_icon: agent.icon, prompt: prompt.slice(0, 2000) });
                         await save();
-                        // Each step gets its own hidden chat, so agents don't see each other's history.
-                        const session = await this.deps.messageService.createSession(userId, "pipeline", `🔀 ${pipelineName} · ${entry.label}`);
-                        const signal = AbortSignal.timeout(STEP_TIMEOUT_MS);
-                        const { text, error } = native
-                            ? await this.deps.nativeAgents!.runOnce(agent as NativeAgentRow, userId, session.id, prompt, signal)
-                            : await this.deps.agents.runOnce(agent as AgentRow, userId, session.id, prompt, signal);
+                        const { text, error } = await this.runAgent(userId, node.agent_kind, agent, prompt, `🔀 ${pipelineName} · ${entry.label}`);
                         entry.finished_at = now();
                         if (!text || error) {
                             Object.assign(entry, { status: "failed", error: error ?? "The agent returned no output", output: text || undefined });
@@ -90,6 +82,49 @@ export class FlowRunner {
                         Object.assign(entry, { status: "succeeded", output: text });
                         state.outputs[node.id] = clip(text);
                         state.previous = clip(text);
+                        state.current = next(node.id);
+                        break;
+                    }
+
+                    case "parallel": {
+                        // Every agent must still exist before any of them starts.
+                        const agents = await Promise.all(node.branches.map((b) => this.loadAgent(userId, b.agent_kind, b.agent_id)));
+                        const gone = node.branches.find((_b, k) => !agents[k]);
+                        if (gone) throw new FlowStop(`"${entry.label} → ${gone.label}": the agent was deleted`);
+                        const prompts = node.branches.map((b) => renderInstruction(b.instruction, state));
+                        const branches: ParallelBranchTrace[] = node.branches.map((b, k) => ({
+                            id: b.id, label: b.label, kind: b.agent_kind, agent_id: agents[k]!.id, agent_name: agents[k]!.name, agent_icon: agents[k]!.icon,
+                            status: "running", prompt: prompts[k].slice(0, 2000), started_at: now(),
+                        }));
+                        entry.branches = branches;
+                        await save();
+
+                        // Branches finish in any order; their progress saves go one at a time.
+                        let saving = Promise.resolve();
+                        const saveInOrder = () => (saving = saving.then(save).catch((e) => console.warn(`[workflows] run ${runId}: couldn't save progress:`, e)));
+                        await Promise.all(node.branches.map(async (b, k) => {
+                            const t = branches[k];
+                            const { text, error } = await this.runAgent(userId, b.agent_kind, agents[k]!, prompts[k], `🔀 ${pipelineName} · ${entry.label} · ${b.label}`)
+                                .catch((err) => ({ text: "", error: err instanceof Error ? err.message : String(err) }));
+                            t.finished_at = now();
+                            if (!text || error) Object.assign(t, { status: "failed", error: error ?? "The agent returned no output", output: text || undefined });
+                            else Object.assign(t, { status: "succeeded", output: text });
+                            await saveInOrder();
+                        }));
+                        await saving;
+
+                        entry.finished_at = now();
+                        const failed = branches.filter((t) => t.status === "failed");
+                        if (failed.length === branches.length || (node.require_all && failed.length)) {
+                            Object.assign(entry, { status: "failed", error: failed.map((t) => `${t.label}: ${t.error}`).join("; ") });
+                            throw new FlowStop(`"${entry.label}" failed — ${entry.error}`);
+                        }
+                        // {{node.<id>.<branch id>}} = one answer; {{node.<id>}} / {{previous}} = all of them.
+                        for (const t of branches) if (t.status === "succeeded") state.outputs[`${node.id}.${t.id}`] = clip(t.output!);
+                        const combined = branches.map((t) => `## ${t.label}\n\n${t.status === "succeeded" ? t.output : `(No answer — ${t.error})`}`).join("\n\n");
+                        Object.assign(entry, { status: "succeeded", output: clip(combined) });
+                        state.outputs[node.id] = clip(combined);
+                        state.previous = clip(combined);
                         state.current = next(node.id);
                         break;
                     }
@@ -192,6 +227,21 @@ export class FlowRunner {
         }
     }
 
+    private async loadAgent(userId: string, kind: "agent" | "native", id: string): Promise<AgentRow | NativeAgentRow | null> {
+        return kind === "native"
+            ? (await this.deps.nativeAgents?.get(userId, id).catch(() => null)) ?? null
+            : this.deps.agentRepo.getAgent(id, userId);
+    }
+
+    // One agent turn in its own hidden chat, so agents don't see each other's history.
+    private async runAgent(userId: string, kind: "agent" | "native", agent: AgentRow | NativeAgentRow, prompt: string, title: string): Promise<{ text: string; error: string | null }> {
+        const session = await this.deps.messageService.createSession(userId, "pipeline", title);
+        const signal = AbortSignal.timeout(STEP_TIMEOUT_MS);
+        return kind === "native"
+            ? this.deps.nativeAgents!.runOnce(agent as NativeAgentRow, userId, session.id, prompt, signal)
+            : this.deps.agents.runOnce(agent as AgentRow, userId, session.id, prompt, signal);
+    }
+
     // AI routing: the model names one route (or NONE). A model/network error
     // is retried once and then fails the step — a silent misroute is worse
     // than a visible failure. An unclear answer takes Otherwise.
@@ -235,9 +285,9 @@ export class FlowRunner {
 function renderInstruction(instruction: string, state: FlowRunState): string {
     const text = instruction.trim() || "{{previous}}";
     const filled = renderTemplate(text, state.input, state.previous, state.outputs);
-    return /\{\{\s*(input|previous|node\.[A-Za-z0-9_-]+)\s*\}\}/.test(text) ? filled : `${filled}\n\n---\nInput:\n${state.previous}`;
+    return /\{\{\s*(input|previous|node\.[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)?)\s*\}\}/.test(text) ? filled : `${filled}\n\n---\nInput:\n${state.previous}`;
 }
 
 function defaultLabel(n: FlowNode): string {
-    return { start: "Start", agent: "Agent", condition: "Condition", router: "Router", approval: "Approval", notify: "Notify", end: "End" }[n.type];
+    return { start: "Start", agent: "Agent", parallel: "Parallel", condition: "Condition", router: "Router", approval: "Approval", notify: "Notify", end: "End" }[n.type];
 }

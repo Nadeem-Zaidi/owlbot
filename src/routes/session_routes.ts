@@ -15,6 +15,7 @@ import { KnowledgeBase } from "../service/knowledge_base";
 import { BillingService } from "../service/billing/billing_service";
 import { ModelRegistry } from "../service/model_registry";
 import { AgentRuntime } from "../core/runtime";
+import { DOCUMENTS_PACK } from "../core/documents/document_tools";
 dotenv.config();
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY ?? "";
 const MAX_PINNED = 50;
@@ -180,7 +181,7 @@ export class ChatMessages extends BaseRouter<MessageService> {
 
 
         this.router.post("/chat_stream", this.asyncHandler(async (req, res) => {
-            const { llmMessage, currentSessionId, provider, model, agentId, nativeAgentId }: { llmMessage: LLMMessage, currentSessionId: any, provider?: string, model?: string, agentId?: string, nativeAgentId?: string } = req.body;
+            const { llmMessage, currentSessionId, provider, model, agentId, nativeAgentId, toolPacks }: { llmMessage: LLMMessage, currentSessionId: any, provider?: string, model?: string, agentId?: string, nativeAgentId?: string, toolPacks?: unknown } = req.body;
             // Session check, attachments, agent and model choice all happen in
             // the runtime; a bad request is rejected here (400/404) before any
             // streaming starts.
@@ -194,6 +195,8 @@ export class ChatMessages extends BaseRouter<MessageService> {
                 strictModel: true,
                 agentId: typeof agentId === "string" ? agentId : undefined,
                 nativeAgentId: typeof nativeAgentId === "string" ? nativeAgentId : undefined,
+                // Only packs this server knows ("documents" = Word & Excel).
+                toolPacks: Array.isArray(toolPacks) && toolPacks.includes(DOCUMENTS_PACK) ? [DOCUMENTS_PACK] : [],
                 ...(req.workspace ? { kbScope: kbScope(req) } : {}),
                 ...desktopAccess(req),
             });

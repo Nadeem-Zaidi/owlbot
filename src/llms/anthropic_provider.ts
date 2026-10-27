@@ -1,6 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ToolLoopGuard } from "./tool_loop_guard";
-import { runTool } from "./tool_runner";
+import { runToolCalls, ToolCallRequest, withToolPacks } from "./tool_runner";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
@@ -285,7 +285,7 @@ export class AnthropicProvider implements ILLM {
         run?: ChatRunOptions
     ): AsyncGenerator<LLMMessage, void, unknown> {
         const activeModel = model ?? this.config.model;
-        const toolset: ToolSource = run?.tools ?? this.tools;
+        const toolset: ToolSource = withToolPacks(run?.tools ?? this.tools, run?.toolPacks);
         // save the incoming message
         await this.messageService.runTransaction(sessionId, messages);
         //load the user message for the current session Id
@@ -441,21 +441,29 @@ export class AnthropicProvider implements ILLM {
             const toolOutputs: LLMMessage[] = [];
             const toolResults: Anthropic.Beta.BetaToolResultBlockParam[] = [];
 
-            for (const toolUse of toolUses) {
+            // Parallel tools in this turn (e.g. several helper agents) run at the same time.
+            const requests: ToolCallRequest[] = toolUses.map((toolUse) => {
                 const args = (toolUse.input ?? {}) as Record<string, any>;
+                const invalid = this.validateToolInput(toolset, toolUse.name, args);
+                return { name: toolUse.name, args, ...(invalid ? { invalid: `Invalid arguments for "${toolUse.name}": ${invalid}` } : {}) };
+            });
+            for (const [k, toolUse] of toolUses.entries()) {
                 yield {
                     type: "function_call_arguments",
                     tool_call_id: toolUse.id,
-                    arguments: JSON.stringify(args),
+                    arguments: JSON.stringify(requests[k].args),
                 } as unknown as LLMMessage;
+            }
+            const outcomes = yield* runToolCalls(toolset, requests, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
 
+            for (const [k, toolUse] of toolUses.entries()) {
+                const args = requests[k].args;
+                const outcome = outcomes[k];
                 let result: string;
                 let isError = false;
                 try {
-                    const invalid = this.validateToolInput(toolset, toolUse.name, args);
-                    if (invalid) throw new Error(`Invalid arguments for "${toolUse.name}": ${invalid}`);
-
-                    const toolOutput = yield* runTool(toolset, toolUse.name, args, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
+                    if (!outcome.ok) throw outcome.error;
+                    const toolOutput = outcome.value;
                     result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
                     yield { type: "function_call_output", tool_call_id: toolUse.id, output: result } as LLMMessage;
                     guard.record(toolUse.name, result);

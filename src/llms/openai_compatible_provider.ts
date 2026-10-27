@@ -1,6 +1,6 @@
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ToolLoopGuard } from "./tool_loop_guard";
-import { runTool } from "./tool_runner";
+import { runToolCalls, ToolCallRequest, withToolPacks } from "./tool_runner";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool } from "../types/llm_message";
 import { LLMResponse } from "../types/llm_response";
 import { LLMConfig } from "../types/lmconfig";
@@ -230,7 +230,7 @@ export class OpenAICompatibleProvider implements ILLM {
 
     async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, _apiKey: string, signal: AbortSignal, model?: string, run?: ChatRunOptions): AsyncGenerator<LLMMessage, void, unknown> {
         const activeModel = model ?? this.config.model;
-        const toolset: ToolSource = run?.tools ?? this.tools;
+        const toolset: ToolSource = withToolPacks(run?.tools ?? this.tools, run?.toolPacks);
 
         // Re-checked on every request: a hostname could start resolving to a
         // private address after the key was saved.
@@ -357,15 +357,25 @@ export class OpenAICompatibleProvider implements ILLM {
             const calls: LLMMessage[] = [];
             const outputs: LLMMessage[] = [];
 
-            for (const call of turn.toolCalls) {
+            // Parallel tools in this turn (e.g. several helper agents) run at the same time.
+            const requests: ToolCallRequest[] = turn.toolCalls.map((call) => {
                 let args: Record<string, any> = {};
                 try { args = call.function.arguments ? JSON.parse(call.function.arguments) : {}; } catch { args = {}; }
+                return { name: call.function.name, args };
+            });
+            for (const [k, call] of turn.toolCalls.entries()) {
                 yield { id: call.id, name: call.function.name, type: "function_call", tool_call_id: call.id } as LLMMessage;
-                yield { type: "function_call_arguments", tool_call_id: call.id, arguments: JSON.stringify(args) } as unknown as LLMMessage;
+                yield { type: "function_call_arguments", tool_call_id: call.id, arguments: JSON.stringify(requests[k].args) } as unknown as LLMMessage;
+            }
+            const outcomes = yield* runToolCalls(toolset, requests, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
 
+            for (const [k, call] of turn.toolCalls.entries()) {
+                const args = requests[k].args;
+                const outcome = outcomes[k];
                 let result: string;
                 try {
-                    const output = yield* runTool(toolset, call.function.name, args, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
+                    if (!outcome.ok) throw outcome.error;
+                    const output = outcome.value;
                     result = typeof output === "string" ? output : JSON.stringify(output);
                     yield { type: "function_call_output", tool_call_id: call.id, output: result } as LLMMessage;
                     guard.record(call.function.name, result);

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { InvalidSession, SessionValidationError, ValidationError } from "../../error_handling/app_error";
 import { ILLM } from "../../interfaces/illm";
-import { LLMProvider } from "../../llms/llm_factory";
+import { LLMProvider, PROVIDER_LABELS } from "../../llms/llm_factory";
 import { AgentService } from "../../service/agents/agent_service";
 import { isOwner } from "../../service/agents/owner";
 import { withAttachmentText } from "../../service/attachment_text";
@@ -131,12 +131,18 @@ export class AgentRuntime {
                 // personal agent, by an app owner (OWNER_EMAILS) — never otherwise.
                 const local = req.channel === "web" && req.localCommands && agent.user_id === userId && !agent.workspace_id && isOwner(req.localCommands.email);
                 const run = await this.deps.agents.buildRun(agent, local ? { localCommands: { platform: req.localCommands!.platform } } : {});
+                // Packs on the agent, plus any the user turned on in this chat.
+                run.toolPacks = [...new Set([...(run.toolPacks ?? []), ...(req.toolPacks ?? [])])];
+                run.systemPrompt = [run.systemPrompt, modelIdentity(llm, model)].filter(Boolean).join("\n\n");
                 return { kind: "agent", llm, model, run, agentId: agent.id };
             }
         }
 
         const { llm, model } = await this.resolveChatModel(req);
-        return { kind: "chat", llm, model, ...(req.kbScope ? { run: { kbScope: req.kbScope } } : {}) };
+        return {
+            kind: "chat", llm, model,
+            run: { systemPrompt: `You are Owl Bot, the assistant in the Owl Bot app.\n\n${modelIdentity(llm, model)}`, ...(req.kbScope ? { kbScope: req.kbScope } : {}), toolPacks: req.toolPacks ?? [] },
+        };
     }
 
     // Only models configured for the server, or on the user's own key — a
@@ -224,3 +230,11 @@ export class AgentRuntime {
 const defaultLanes = new SessionLanes();
 
 const short = (id: string) => id.slice(0, 8);
+
+// Which model is answering. Without it a model guesses its own identity —
+// DeepSeek, for one, often claims to be Claude or ChatGPT.
+function modelIdentity(llm: ILLM, model: string): string {
+    const provider = llm.getProvider();
+    const label = PROVIDER_LABELS[provider] ?? provider;
+    return `You are running on the ${label} model "${model}". If asked which model or AI you are, say exactly that — never claim to be a different model.`;
+}

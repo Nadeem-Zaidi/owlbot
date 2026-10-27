@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { ToolLoopGuard } from "./tool_loop_guard";
-import { runTool } from "./tool_runner";
+import { runToolCalls, ToolCallRequest, withToolPacks } from "./tool_runner";
 import type { ResponseFunctionToolCall, ResponseInputFile, ResponseInputImage, ResponseInputItem, ResponseInputText, ResponseOutputText } from "openai/resources/responses/responses";
 import { ChatRunOptions, ILLM, ToolSource } from "../interfaces/illm";
 import { ContentPart, FileInput, ImageBase64Content, ImageUrlContent, LLMMessage, TextContent, Tool, ToolCall } from "../types/llm_message";
@@ -242,7 +242,7 @@ export class OpenAIProvider implements ILLM {
     }
     async *chatStream(messages: LLMMessage[], userId: string, sessionId: string, apiKey: string, signal: AbortSignal, model?: string, run?: ChatRunOptions): AsyncGenerator<LLMMessage, void, unknown> {
         const activeModel = model ?? this.config.model;
-        const toolset: ToolSource = run?.tools ?? this.tools;
+        const toolset: ToolSource = withToolPacks(run?.tools ?? this.tools, run?.toolPacks);
         await this.messageService.runTransaction(sessionId, messages);
         const userSessionMessages = await this.messageService.loadMessages(sessionId);
         // Title after the first exchange (or for a chat still untitled). Not by
@@ -330,6 +330,8 @@ export class OpenAIProvider implements ILLM {
             const mcpCallTools = new Map<string, any>();
             const codeInterpreterCalls = new Map<string, { id: string; container_id?: string; code: string; status: string }>();
             let calledAnyToolThisTurn = false;
+            // Function calls of this response, run together once it completes.
+            const queuedCalls: { name: string; tool_call_id: string; arguments: string }[] = [];
             const wireTools = [...functionTools, ...mcpTools, ...buildCodeInterpreterTools()];
             // For an estimate if the user stops this request before it completes.
             const requestChars = JSON.stringify(inputMessages).length + JSON.stringify(wireTools).length;
@@ -638,80 +640,10 @@ export class OpenAIProvider implements ILLM {
                                     tool_call_id: item.tool_call_id,
                                     arguments: item.arguments,
                                 } as LLMMessage;
-
-                                let result: string;
-                                let parsedArgs: Record<string, any> = {};
-                                try {
-                                    const db = await this.messageService.rawDb() as unknown as IDatabaseAdapter;
-                                    try {
-                                        parsedArgs = item.arguments ? JSON.parse(item.arguments) : {};
-                                    } catch {
-                                        throw new Error(`Model produced invalid JSON arguments for "${item.name}": ${item.arguments}`);
-                                    }
-
-                                    const toolOutput = yield* runTool(toolset, item.name, parsedArgs, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
-                                    result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
-                                    yield {
-                                        type: "function_call_output",
-                                        tool_call_id: item.tool_call_id,
-                                        output: result,
-                                    } as LLMMessage;
-                                    guard.record(item.name, result);
-
-                                    try {
-                                        if (item.name === this.RAG_TOOL_NAME) {
-                                            const parsedOutput = typeof toolOutput === "string" ? JSON.parse(toolOutput) : toolOutput;
-                                            const resultsArray = Array.isArray(parsedOutput)
-                                                ? parsedOutput
-                                                : parsedOutput
-                                                    ? [parsedOutput]
-                                                    : [];
-
-                                            const filenames: string[] = resultsArray
-                                                .map((r: any) => r?.source_file)
-                                                .filter((f: unknown): f is string => typeof f === "string" && f.length > 0);
-
-                                            if (filenames.length) {
-                                                filenames.forEach((f) => collectedSources.add(f));
-                                                yield {
-                                                    type: "sources",
-                                                    tool_call_id: item.tool_call_id,
-                                                    sources: Array.from(collectedSources),
-                                                } as unknown as LLMMessage;
-                                            }
-                                        }
-                                    } catch {
-
-                                    }
-                                } catch (toolErr) {
-                                    const errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
-                                    result = JSON.stringify({
-                                        error: true,
-                                        message: errMsg,
-                                        hint: "Tool execution failed. Do not retry with the same arguments."
-                                    });
-                                    guard.record(item.name, result, true);
-                                    yield {
-                                        type: "function_call_output",
-                                        tool_call_id: item.tool_call_id,
-                                        error: result,
-                                    } as LLMMessage;
-                                }
-
-                                const toolCall: LLMMessage = { role: "tool_call", type: "tool_call", tool_call_id: item.tool_call_id, name: item.name, arguments: parsedArgs };
-                                const toolResult: LLMMessage = { role: "tool_call_output", type: "tool_call_output", tool_call_id: item.tool_call_id, output: result };
-
-                                try {
-                                    await this.messageService.runTransaction(sessionId, [toolCall, toolResult]);
-                                } catch (dbErr) {
-                                    const dbErrMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
-                                    yield { type: "error", code: "error", message: `Something went wrong while saving the tool result: ${dbErrMsg}`, error: "Something went wrong while saving the tool result. Please try again." } as LLMMessage;
-                                    continueLoop = false;
-                                }
-
-                                inputMessages = [...inputMessages, ...this.fromInput([toolCall, toolResult])];
+                                // Runs when the response completes, so calls the model made
+                                // together (e.g. several helper agents) can run in parallel.
+                                queuedCalls.push(item);
                                 functionCallTools.delete(event.item_id);
-                                calledAnyToolThisTurn = true; // a real tool ran; the model still needs a follow-up request to see its output
                             }
                         }
 
@@ -752,6 +684,54 @@ export class OpenAIProvider implements ILLM {
                         if (event.type === "response.completed") {
                             sawResponseCompleted = true;
                             if (event.response?.usage) { roundBilled = true; const u = openaiUsage(event.response.usage); guard.addTokens(u.input_tokens + u.output_tokens); yield usageIncrement(u, event.response.model ?? activeModel); }
+                            if (queuedCalls.length) {
+                                const items = queuedCalls.splice(0);
+                                const requests: ToolCallRequest[] = items.map((item) => {
+                                    try {
+                                        return { name: item.name, args: item.arguments ? JSON.parse(item.arguments) : {} };
+                                    } catch {
+                                        return { name: item.name, args: {}, invalid: `Model produced invalid JSON arguments for "${item.name}": ${item.arguments}` };
+                                    }
+                                });
+                                const db = await this.messageService.rawDb() as unknown as IDatabaseAdapter;
+                                const outcomes = yield* runToolCalls(toolset, requests, { db, userId, sessionId, kbScope: run?.kbScope }, signal);
+                                for (const [k, item] of items.entries()) {
+                                    const parsedArgs = requests[k].args;
+                                    const outcome = outcomes[k];
+                                    let result: string;
+                                    try {
+                                        if (!outcome.ok) throw outcome.error;
+                                        const toolOutput = outcome.value;
+                                        result = typeof toolOutput === "string" ? toolOutput : JSON.stringify(toolOutput);
+                                        yield { type: "function_call_output", tool_call_id: item.tool_call_id, output: result } as LLMMessage;
+                                        guard.record(item.name, result);
+                                        if (item.name === this.RAG_TOOL_NAME) {
+                                            const filenames = ragSourceFiles(toolOutput);
+                                            if (filenames.length) {
+                                                filenames.forEach((f) => collectedSources.add(f));
+                                                yield { type: "sources", tool_call_id: item.tool_call_id, sources: Array.from(collectedSources) } as unknown as LLMMessage;
+                                            }
+                                        }
+                                    } catch (toolErr) {
+                                        const errMsg = toolErr instanceof Error ? toolErr.message : String(toolErr);
+                                        result = JSON.stringify({ error: true, message: errMsg, hint: "Tool execution failed. Do not retry with the same arguments." });
+                                        guard.record(item.name, result, true);
+                                        yield { type: "function_call_output", tool_call_id: item.tool_call_id, error: result } as LLMMessage;
+                                    }
+
+                                    const toolCall: LLMMessage = { role: "tool_call", type: "tool_call", tool_call_id: item.tool_call_id, name: item.name, arguments: parsedArgs };
+                                    const toolResult: LLMMessage = { role: "tool_call_output", type: "tool_call_output", tool_call_id: item.tool_call_id, output: result };
+                                    try {
+                                        await this.messageService.runTransaction(sessionId, [toolCall, toolResult]);
+                                    } catch (dbErr) {
+                                        const dbErrMsg = dbErr instanceof Error ? dbErr.message : String(dbErr);
+                                        yield { type: "error", code: "error", message: `Something went wrong while saving the tool result: ${dbErrMsg}`, error: "Something went wrong while saving the tool result. Please try again." } as LLMMessage;
+                                        continueLoop = false;
+                                    }
+                                    inputMessages = [...inputMessages, ...this.fromInput([toolCall, toolResult])];
+                                }
+                                calledAnyToolThisTurn = true; // a real tool ran; the model still needs a follow-up request to see its output
+                            }
                             if (!functionCallTools.size && !mcpCallTools.size) {
                                 if (calledAnyToolThisTurn) {
                                     guard.endRound();
@@ -896,4 +876,15 @@ function openaiUsage(u: any): TokenCounts {
         cache_read_tokens: cached,
         cache_write_tokens: 0,
     };
+}
+
+// The file names a knowledge-base search returned (its sources).
+function ragSourceFiles(toolOutput: unknown): string[] {
+    try {
+        const parsed = typeof toolOutput === "string" ? JSON.parse(toolOutput) : toolOutput;
+        const results: any[] = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+        return results.map((r) => r?.source_file).filter((f: unknown): f is string => typeof f === "string" && f.length > 0);
+    } catch {
+        return [];
+    }
 }

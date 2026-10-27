@@ -35,7 +35,8 @@ export function skillIndexPrompt(index: SkillIndexEntry[]): string {
         "Skills you can load — the user's own expert instructions. Before answering, check this list: if the request " +
         "matches a skill's description, call load_skill with its name first and follow those instructions " +
         "(they take priority over your general knowledge). If a skill was already loaded in this conversation, use it. " +
-        "Don't load skills that aren't relevant.",
+        "Don't load skills that aren't relevant. The list is for you, not a description of who you are: " +
+        "don't mention or advertise these skills unless the user's request needs one.",
         ...index.map((s) => `- ${s.name}: ${s.description}`),
     ].join("\n");
 }

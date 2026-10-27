@@ -21,6 +21,9 @@ export const BUILTIN_TOOLS = [
     { id: "read_document", label: "Read a full document", description: "Reads an entire document when a passage isn't enough." },
     { id: "list_documents", label: "List documents", description: "Lets the agent see which documents it can use." },
     { id: "current_datetime", label: "Current date & time", description: "For anything time-sensitive (deadlines, “today”)." },
+    // An opt-in pack (DOCUMENTS_PACK): the tools themselves come with the
+    // agent's always-on tools, but are only offered when this is ticked.
+    { id: "documents", label: "Create Word & Excel files", description: "Makes .docx documents and .xlsx spreadsheets to download." },
     { id: "code_interpreter", label: "Code interpreter", description: "Runs Python for maths and data. ChatGPT models only." },
     // Added to the agent only in its owner's live chat in the desktop app
     // (AgentService.buildRun); the user approves every command there.
@@ -160,6 +163,8 @@ export function httpFunctionTool(fn: AgentFunctionRow): ToolDefinition {
         name: fn.name,
         description: fn.description || `Calls ${fn.method} ${fn.url}`,
         parameters: paramsToSchema(fn.parameters),
+        // GET requests only read, so several can run at once.
+        parallel: fn.method === "GET",
         execute: async (args) => {
             const result = await callHttpFunction(fn, args);
             if (!result.ok) throw new Error(`HTTP ${result.status}: ${JSON.stringify(result.body).slice(0, 2000)}`);
@@ -284,7 +289,8 @@ export function buildAgentToolSet(
     const tools: ToolDefinition[] = [];
     for (const id of agent.builtin_tools) {
         const t = builtinTool(id, deps, agent.document_keys);
-        if (t) tools.push(t);
+        // Built-ins only read (documents, the clock), so they can run side by side.
+        if (t) tools.push({ ...t, parallel: true });
     }
     for (const fn of functions) if (fn.enabled) tools.push(httpFunctionTool(fn));
     for (const fn of codeFunctions) if (fn.enabled) tools.push(codeFunctionTool(fn));

@@ -3,6 +3,7 @@ import type { AgentRow } from "../../repository/agent_repository";
 import { BUILTIN_TOOL_IDS } from "../../service/agents/agent_tools";
 import { ScheduleTiming, validateTiming } from "../../service/agents/schedule_time";
 import type { FlowNode } from "../flows/flow_types";
+import { MAX_PARALLEL_BRANCHES } from "../flows/flow_validate";
 import { AgentDraft, Port, StudioCanvas, StudioEdge, StudioNode, SUB_PORT, SubNodeType, TriggerConfig } from "./studio_types";
 
 export const MAX_STUDIO_NODES = 90;      // everything on the canvas
@@ -202,7 +203,7 @@ export const REPLY_PREFIX = "__reply_";
 // the agents' own settings. With `deliver`, a "send the result" step goes in
 // front of every End.
 export function compileFlow(canvas: StudioCanvas, agentIdOf: (nodeId: string) => string, deliver: { projectName: string } | null) {
-    const nodes: any[] = [];
+    let nodes: any[] = [];
     for (const n of canvas.nodes) {
         if (isSub(n)) continue;
         if (n.type === "trigger") nodes.push({ id: n.id, type: "start", position: n.position, label: n.label ?? "Trigger" });
@@ -210,6 +211,7 @@ export function compileFlow(canvas: StudioCanvas, agentIdOf: (nodeId: string) =>
         else nodes.push(n as FlowNode);
     }
     let edges: any[] = canvas.edges.filter((e) => !e.port).map((e) => ({ id: e.id, from: e.from, to: e.to, ...(e.branch ? { branch: e.branch } : {}) }));
+    ({ nodes, edges } = groupParallel(nodes, edges));
     if (deliver) {
         const ends = canvas.nodes.filter((n): n is Extract<StudioNode, { type: "end" }> => n.type === "end");
         ends.forEach((end, i) => {
@@ -221,6 +223,61 @@ export function compileFlow(canvas: StudioCanvas, agentIdOf: (nodeId: string) =>
         });
     }
     return { version: 1, nodes, edges };
+}
+
+export const PARALLEL_PREFIX = "__par_";
+
+// One output wired to several agents that all lead into the same next step
+// runs those agents at the same time: they become one parallel step (each
+// agent a branch, keyed by its node id). {{node.<agent node>}} elsewhere
+// then points at that branch's answer.
+function groupParallel(nodes: any[], edges: any[]): { nodes: any[]; edges: any[] } {
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const outOf = (id: string) => edges.filter((e) => e.from === id);
+    const name = (id: string): string => byId.get(id)?.label ?? id;
+    const groups = new Map<string, any[]>();       // "from:branch" → its edges
+    for (const e of edges) groups.set(`${e.from}:${e.branch ?? ""}`, [...(groups.get(`${e.from}:${e.branch ?? ""}`) ?? []), e]);
+
+    const renamed = new Map<string, string>();     // agent node id → "<parallel id>.<agent node id>"
+    let k = 0;
+    for (const fan of groups.values()) {
+        if (fan.length < 2) continue;
+        const from = `"${name(fan[0].from)}"`;
+        const agents = fan.map((e) => byId.get(e.to));
+        if (agents.some((a) => a?.type !== "agent")) throw new StudioError(`${from} connects to several steps — only agents can run side by side. Keep one connection, or connect it only to agents`);
+        if (fan.length > MAX_PARALLEL_BRANCHES) throw new StudioError(`${from}: at most ${MAX_PARALLEL_BRANCHES} agents can run at the same time`);
+        let join: string | null = null;
+        for (const a of agents) {
+            if (edges.filter((e) => e.to === a.id).length !== 1) throw new StudioError(`"${name(a.id)}" runs alongside other agents, so only ${from} can connect into it`);
+            const out = outOf(a.id);
+            if (out.length !== 1) throw new StudioError(`"${name(a.id)}" runs alongside other agents — connect it to exactly one next step`);
+            join ??= out[0].to;
+            if (out[0].to !== join) throw new StudioError(`The agents after ${from} run at the same time, so they must all connect into the same next step`);
+        }
+
+        const id = `${PARALLEL_PREFIX}${k++}`;
+        const used = new Set<string>();
+        const branches = agents.map((a) => {
+            let label = (a.label as string).slice(0, 40);
+            for (let i = 2; used.has(label.toLowerCase()); i++) label = `${(a.label as string).slice(0, 36)} ${i}`;
+            used.add(label.toLowerCase());
+            renamed.set(a.id, `${id}.${a.id}`);
+            return { id: a.id, label, agent_kind: "agent", agent_id: a.agent_id, instruction: a.instruction };
+        });
+        const position = { x: Math.round(agents.reduce((s, a) => s + a.position.x, 0) / agents.length), y: Math.round(agents.reduce((s, a) => s + a.position.y, 0) / agents.length) };
+        const gone = new Set(agents.map((a) => a.id));
+        nodes = [...nodes.filter((n) => !gone.has(n.id)), { id, type: "parallel", position, label: "Agents in parallel", branches, require_all: true }];
+        edges = [
+            ...edges.filter((e) => !gone.has(e.from) && !gone.has(e.to)),
+            { id: `${id}-in`, from: fan[0].from, to: id, ...(fan[0].branch ? { branch: fan[0].branch } : {}) },
+            { id: `${id}-out`, from: id, to: join },
+        ];
+    }
+    if (!renamed.size) return { nodes, edges };
+    // {{node.<agent node>}} and "node.<agent node>" sources → that branch's answer.
+    const ref = /node\.([A-Za-z0-9_-]+)(?![A-Za-z0-9_.-])/g;
+    nodes = nodes.map((n) => JSON.parse(JSON.stringify(n).replace(ref, (m, id: string) => (renamed.has(id) ? `node.${renamed.get(id)}` : m))));
+    return { nodes, edges };
 }
 
 // An agent can appear several times (e.g. Jira at the start and the end).

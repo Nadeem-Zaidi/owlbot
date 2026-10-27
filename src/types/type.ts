@@ -114,6 +114,12 @@ export interface ToolDefinition {
     args: Record<string, any>,
     ctx: ToolContext
   ) => Promise<any> | any;
+  // Safe to run at the same time as other parallel tools of the same turn
+  // (no side effects, never asks the user anything).
+  parallel?: boolean;
+  // Part of an opt-in tool pack (e.g. "documents"): only offered to the model
+  // when that pack is turned on for the run (ChatRunOptions.toolPacks).
+  pack?: string;
 }
 
 export type Session={

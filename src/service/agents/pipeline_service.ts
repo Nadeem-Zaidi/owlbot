@@ -101,7 +101,10 @@ export class PipelineService {
                 kind === "native" ? !!(await this.nativeAgent(userId, id)) : !!(await this.agentRepo.getAgent(id, userId)),
             ).catch((err) => { throw err instanceof FlowError ? new AgentError(err.message, err.status) : err; });
             // `steps` lists the agent steps (for the gallery's "N steps").
-            const steps = flow.nodes.flatMap((n) => (n.type === "agent" ? [{ kind: n.agent_kind, agent_id: n.agent_id, instruction: n.instruction }] : []));
+            const steps = flow.nodes.flatMap((n) =>
+                n.type === "agent" ? [{ kind: n.agent_kind, agent_id: n.agent_id, instruction: n.instruction }]
+                : n.type === "parallel" ? n.branches.map((b) => ({ kind: b.agent_kind, agent_id: b.agent_id, instruction: b.instruction }))
+                : []);
             return { name, description, steps, flow };
         }
         const raw = Array.isArray(b?.steps) ? b.steps : [];
@@ -153,10 +156,14 @@ export class PipelineService {
     // ── workflows ──
     private async startFlow(userId: string, pipelineId: string, name: string, flow: Flow, input: string) {
         // Provider agents must be usable before anything runs.
-        for (const n of flow.nodes) {
-            if (n.type !== "agent" || n.agent_kind !== "native") continue;
-            const agent = await this.nativeAgent(userId, n.agent_id);
-            if (agent) await this.nativeAgents!.requireActive(userId, agent).catch((err) => { throw new AgentError(`"${n.label ?? n.id}": ${err.message}`, 409); });
+        const uses = flow.nodes.flatMap((n) =>
+            n.type === "agent" ? [{ name: n.label ?? n.id, kind: n.agent_kind, id: n.agent_id }]
+            : n.type === "parallel" ? n.branches.map((b) => ({ name: `${n.label ?? n.id} → ${b.label}`, kind: b.agent_kind, id: b.agent_id }))
+            : []);
+        for (const u of uses) {
+            if (u.kind !== "native") continue;
+            const agent = await this.nativeAgent(userId, u.id);
+            if (agent) await this.nativeAgents!.requireActive(userId, agent).catch((err) => { throw new AgentError(`"${u.name}": ${err.message}`, 409); });
         }
         const state = this.flows.initialState(input, flow);
         const run = await this.repo.startRun(pipelineId, userId, input, [], state);

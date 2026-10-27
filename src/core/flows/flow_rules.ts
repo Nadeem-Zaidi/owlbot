@@ -80,13 +80,14 @@ export function renderTemplate(template: string, input: string, previous: string
     return template
         .replace(/\{\{\s*input\s*\}\}/g, input)
         .replace(/\{\{\s*previous\s*\}\}/g, previous)
-        .replace(/\{\{\s*node\.([A-Za-z0-9_-]+)\s*\}\}/g, (_m, id: string) => outputs[id] ?? "");
+        .replace(/\{\{\s*node\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)\s*\}\}/g, (_m, id: string) => outputs[id] ?? "");
 }
 
-// The text a condition looks at: "previous", "input" or "node.<id>".
+// The text a condition looks at: "previous", "input", "node.<id>" or
+// "node.<id>.<branch id>" (one branch of a parallel step).
 export function conditionSource(source: string, input: string, previous: string, outputs: Record<string, string>): string {
     if (source === "input") return input;
-    const m = source.match(/^node\.([A-Za-z0-9_-]+)$/);
+    const m = source.match(/^node\.([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?)$/);
     if (m) return outputs[m[1]] ?? "";
     return previous;
 }
