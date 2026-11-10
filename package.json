@@ -4,7 +4,8 @@
   "description": "owlbot beg",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node -r ts-node/register/transpile-only --test \"tests/**/*.test.ts\"",
+    "test:agents": "node -r ts-node/register/transpile-only --test \"tests/agents/*.test.ts\"",
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
     "build": "tsc && node -e \"require('fs').copyFileSync('src/protos/service.proto','dist/protos/service.proto')\"",
     "start": "node dist/main.js",

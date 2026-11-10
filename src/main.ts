@@ -8,6 +8,7 @@ import { installConsoleBridge, registerGauge } from "./infra/observability";
 import { EventBus } from "./infra/events/event_bus";
 import { LiveSocketServer } from "./gateway/live_socket";
 import { verifySocketToken } from "./authentication/authentication_middleware";
+import { createAuthRouter } from "./routes/auth_routes";
 import { redis, redisSubscriber } from "./infra/redis";
 // Before anything logs: console output becomes structured (LOG_FORMAT=json,
 // default in production) with request/user/run ids, and secrets are masked.
@@ -431,6 +432,7 @@ async function wa() {
     const { searchRouter, usageRouter } = createInsightsRouters(new SearchRepository(db), usageRepo);
 
     const gateway = new VGateway(Number(process.env.PORT ?? 3000), db, chatRoutes, storageRoutes, whatsappRoutes, agentRoutes, pipelineRoutes, [
+        { path: "/api/auth", router: createAuthRouter() },
         { path: "/api/workspaces", router: createWorkspaceRouter(workspaceService, deleteWorkspaceFiles) },
         { path: "/api/search", router: searchRouter },
         { path: "/api/usage", router: usageRouter },
